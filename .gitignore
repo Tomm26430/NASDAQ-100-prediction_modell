@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+*.db
+backend/saved_models/
+.DS_Store
+node_modules/
+dist/

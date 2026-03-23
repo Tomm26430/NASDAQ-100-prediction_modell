@@ -1,0 +1,28 @@
+# FastAPI server and ASGI runner
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+
+# Settings from environment / .env
+pydantic-settings>=2.6.0
+
+# Database ORM and SQLite driver
+sqlalchemy>=2.0.36
+
+# Market data (Yahoo Finance)
+yfinance>=0.2.50
+
+# Data manipulation (used throughout the project for ML later)
+pandas>=2.2.0
+numpy>=2.0.0
+# yfinance optional repair path + many scientific stacks expect SciPy
+scipy>=1.11.0
+
+# Daily background refresh without blocking the API thread
+apscheduler>=3.10.0
+
+# ML stack (per project brief)
+scikit-learn>=1.4.0
+statsmodels>=0.14.0
+pmdarima>=2.0.4
+tensorflow>=2.16.0
+joblib>=1.3.0
