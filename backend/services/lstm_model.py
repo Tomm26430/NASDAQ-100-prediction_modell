@@ -1,9 +1,14 @@
 """
-LSTM forecaster: sequence input (60 days × features), four regression heads (+1, +7, +30, +90).
+LSTM forecaster: sequence input (60 days × features), four heads for cumulative simple returns
+at +1, +7, +30, +90 trading days vs the reference bar.
 
-Targets are cumulative simple returns from the reference bar; inputs use return-based features
-and rolling z-score normalization (no global MinMax). Artifacts live under `saved_models/`
-(or a temporary folder during backtests).
+Training targets are percentage returns: (close[t+h] / close[t]) - 1. At inference,
+predicted_price = anchor_close * (1 + predicted_return), where anchor_close is the last row's
+close in the window (real or synthetic during rollouts).
+
+Input features are return-based columns scaled with sklearn MinMaxScaler (fit on the training
+split only, then saved in the meta joblib). Artifacts live under `saved_models/` or a temp folder
+for backtests.
 """
 
 from __future__ import annotations
@@ -14,6 +19,7 @@ from pathlib import Path
 import joblib
 import numpy as np
 import pandas as pd
+from sklearn.preprocessing import MinMaxScaler
 from sqlalchemy.orm import Session
 
 from config import settings
@@ -23,12 +29,15 @@ from utils.ml_paths import artifact_stem
 
 logger = logging.getLogger(__name__)
 
-# Output order matches [t+1, t+7, t+30, t+90] — cumulative simple returns vs reference close.
+# Model output order: [t+1, t+7, t+30, t+90] as cumulative simple returns vs reference close.
 _HORIZON_DAYS = (1, 7, 30, 90)
+
+# Saved checkpoints with meta_version below this must be retrained (input scaling / heads changed).
+_META_VERSION = 3
 
 
 def lstm_feature_columns() -> list[str]:
-    """Column order fed into the LSTM (after rolling normalization)."""
+    """Column order fed into the LSTM after MinMax scaling."""
     return [
         "ret_close",
         "ret_volume",
@@ -38,6 +47,11 @@ def lstm_feature_columns() -> list[str]:
         "bb_upper_rel",
         "bb_lower_rel",
     ]
+
+
+def min_ohlcv_rows_for_lstm_window(seq_len: int) -> int:
+    """Minimum rows in an indicator-enriched frame needed to build one LSTM window (no rolling z warmup)."""
+    return int(seq_len)
 
 
 def _paths(ticker: str, model_root: Path | None = None) -> tuple[Path, Path]:
@@ -52,13 +66,8 @@ def lstm_model_exists(ticker: str, model_root: Path | None = None) -> bool:
     return mp.is_file() and jp.is_file()
 
 
-def _min_bars_for_lstm(seq_len: int) -> int:
-    """Rolling norm needs seq_len + (window-1) rows so the last window is fully normalized."""
-    return seq_len + settings.LSTM_ROLLING_NORM_WINDOW - 1
-
-
 def _lstm_raw_features(feat: pd.DataFrame) -> pd.DataFrame:
-    """Scale-free raw features before rolling z-score (no global price level)."""
+    """Scale-free raw features before MinMax (no global price level in columns)."""
     close = feat["close"].astype(float)
     vol = feat["volume"].astype(float)
     safe = close.replace(0.0, np.nan)
@@ -74,55 +83,24 @@ def _lstm_raw_features(feat: pd.DataFrame) -> pd.DataFrame:
     return out.replace([np.inf, -np.inf], np.nan)
 
 
-def _rolling_zscore(df: pd.DataFrame, window: int) -> pd.DataFrame:
-    """Per-row z-score using a trailing window (causal; first window-1 rows are NaN)."""
-    m = df.rolling(window=window, min_periods=window).mean()
-    s = df.rolling(window=window, min_periods=window).std()
-    s = s.replace(0.0, np.nan)
-    z = (df - m) / (s + 1e-8)
-    return z.clip(-8.0, 8.0)
-
-
-def _prepare_lstm_input(
-    feat: pd.DataFrame,
-    *,
-    causal: bool = True,
-) -> tuple[pd.DataFrame, pd.Series]:
-    """
-    Rolling z-score on LSTM raw features.
-
-    When causal=True (default for inference and training), we only ffill then fill leading
-    NaNs with 0 — no bfill, so future rows never influence past normalization inputs.
-    """
+def _lstm_feature_matrix(feat: pd.DataFrame) -> pd.DataFrame:
+    """Per-row feature matrix for windows (causal ffill; no backward fill)."""
     raw = _lstm_raw_features(feat)
-    if causal:
-        raw = raw.ffill().fillna(0.0)
-    else:
-        # Legacy path: avoid for walk-forward evaluation (leaks future into past NaNs).
-        raw = raw.ffill().bfill()
-    w = settings.LSTM_ROLLING_NORM_WINDOW
-    norm = _rolling_zscore(raw, w)
-    close = feat["close"].astype(float)
-    return norm, close
+    raw = raw.ffill().fillna(0.0)
+    cols = lstm_feature_columns()
+    return raw[cols]
 
 
 def _build_xy(
     feat_df: pd.DataFrame,
     seq_len: int,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Slide windows over rolling-normalized features; y = cumulative simple returns vs reference close."""
+    """Slide windows over raw scaled features in training; y = cumulative simple returns vs reference close."""
     cols = lstm_feature_columns()
-    # Causal normalization so training matches honest backtest / live prediction (no bfill leakage).
-    norm, close = _prepare_lstm_input(feat_df, causal=True)
-    missing = [c for c in cols if c not in norm.columns]
-    if missing:
-        raise ValueError(f"Feature frame missing columns: {missing}")
-
-    close_arr = close.to_numpy(dtype=np.float64)
-    mat = norm[cols].to_numpy(dtype=np.float64)
+    mat = _lstm_feature_matrix(feat_df).to_numpy(dtype=np.float64)
+    close = feat_df["close"].astype(float).to_numpy(dtype=np.float64)
     n = len(feat_df)
-    w = settings.LSTM_ROLLING_NORM_WINDOW
-    min_i = max(0, w - 1)
+    min_i = 0
 
     X_list: list[np.ndarray] = []
     y_list: list[list[float]] = []
@@ -132,10 +110,10 @@ def _build_xy(
         if np.isnan(window).any():
             continue
         t = i + seq_len - 1
-        ref = close_arr[t]
+        ref = close[t]
         if not np.isfinite(ref) or ref == 0.0:
             continue
-        targets = [(close_arr[t + h] / ref - 1.0) for h in _HORIZON_DAYS]
+        targets = [(close[t + h] / ref - 1.0) for h in _HORIZON_DAYS]
         if any(not np.isfinite(x) for x in targets):
             continue
         X_list.append(window)
@@ -171,7 +149,6 @@ def train_lstm_for_ticker(
     df = get_ohlcv_dataframe(session, ticker)
     if train_end_exclusive is not None:
         df = df.iloc[:train_end_exclusive]
-    # Match inference: no backward-fill on indicators (avoids peeking at future for early NaNs).
     feat = add_indicators(df).ffill().fillna(0.0)
     seq_len = settings.SEQUENCE_LENGTH
     X_raw, y_raw = _build_xy(feat, seq_len)
@@ -180,8 +157,15 @@ def train_lstm_for_ticker(
     split = int(n_s * 0.85)
     if split < 32 or n_s - split < 8:
         split = int(n_s * 0.8)
-    X_train, X_val = X_raw[:split], X_raw[split:]
+    X_train_raw, X_val_raw = X_raw[:split], X_raw[split:]
     y_train, y_val = y_raw[:split], y_raw[split:]
+
+    # Fit MinMaxScaler on training windows only (avoids validation-set leakage into input scale).
+    fx = MinMaxScaler()
+    X_train_flat = X_train_raw.reshape(-1, n_f)
+    X_val_flat = X_val_raw.reshape(-1, n_f)
+    X_train = fx.fit_transform(X_train_flat).reshape(-1, s_len, n_f)
+    X_val = fx.transform(X_val_flat).reshape(-1, s_len, n_f)
 
     keras.utils.set_random_seed(42)
     inp = layers.Input(shape=(seq_len, n_f))
@@ -191,9 +175,14 @@ def train_lstm_for_ticker(
     x = layers.Dropout(settings.LSTM_DROPOUT)(x)
     out = layers.Dense(4)(x)
     model = keras.Model(inp, out)
-    model.compile(optimizer=keras.optimizers.Adam(1e-3), loss="mse")
+    lr = float(settings.LSTM_LEARNING_RATE)
+    model.compile(optimizer=keras.optimizers.Adam(learning_rate=lr), loss="mse")
 
-    es = keras.callbacks.EarlyStopping(monitor="val_loss", patience=5, restore_best_weights=True)
+    es = keras.callbacks.EarlyStopping(
+        monitor="val_loss",
+        patience=int(settings.LSTM_EARLY_STOPPING_PATIENCE),
+        restore_best_weights=True,
+    )
     model.fit(
         X_train,
         y_train,
@@ -208,10 +197,10 @@ def train_lstm_for_ticker(
     model.save(model_path)
     joblib.dump(
         {
+            "fx": fx,
             "feature_cols": lstm_feature_columns(),
             "seq_len": seq_len,
-            "rolling_window": settings.LSTM_ROLLING_NORM_WINDOW,
-            "meta_version": 2,
+            "meta_version": _META_VERSION,
         },
         meta_path,
     )
@@ -232,11 +221,28 @@ def _load_keras_and_meta(ticker: str, model_root: Path | None = None):
         raise FileNotFoundError(f"LSTM bundle missing for {ticker}; train first.")
     model = keras.models.load_model(model_path)
     meta = joblib.load(meta_path)
-    if meta.get("meta_version", 1) < 2 or "fx" in meta:
+    if int(meta.get("meta_version", 0)) < _META_VERSION or "fx" not in meta:
         raise ValueError(
-            f"LSTM for {ticker} uses an old scaler format; retrain to use returns + rolling normalization."
+            f"LSTM for {ticker} is an old checkpoint (meta_version {meta.get('meta_version')}); "
+            "retrain after return targets + MinMax input pipeline change."
         )
     return model, meta
+
+
+def _scaled_window_tensor(feat_df: pd.DataFrame, meta: dict) -> tuple[np.ndarray, float] | None:
+    """Last seq_len rows, MinMax-transformed; returns (batch, seq, n_f) and anchor close."""
+    seq_len = int(meta["seq_len"])
+    cols: list[str] = meta["feature_cols"]
+    mat = _lstm_feature_matrix(feat_df)
+    if len(mat) < seq_len:
+        return None
+    tail = mat.iloc[-seq_len:][cols].to_numpy(dtype=np.float64)
+    if np.isnan(tail).any():
+        return None
+    fx: MinMaxScaler = meta["fx"]
+    w = fx.transform(tail.reshape(-1, tail.shape[1])).reshape(1, seq_len, tail.shape[1]).astype(np.float32)
+    ref_close = float(feat_df["close"].astype(float).iloc[-1])
+    return w, ref_close
 
 
 def predict_lstm_horizons(
@@ -252,21 +258,14 @@ def predict_lstm_horizons(
     feat = add_indicators(df).ffill().fillna(0.0)
     model, meta = _load_keras_and_meta(ticker, model_root)
     seq_len = int(meta["seq_len"])
-    cols: list[str] = meta["feature_cols"]
-    need = _min_bars_for_lstm(seq_len)
+    need = min_ohlcv_rows_for_lstm_window(seq_len)
     if len(feat) < need:
-        raise ValueError(
-            f"Not enough rows ({len(feat)}) for LSTM; need at least {need} "
-            "(sequence length + rolling normalization window − 1)."
-        )
+        raise ValueError(f"Not enough rows ({len(feat)}) for LSTM; need at least {need}.")
 
-    norm, _close_ser = _prepare_lstm_input(feat, causal=True)
-    window = norm.iloc[-seq_len:][cols].to_numpy(dtype=np.float32)
-    if np.isnan(window).any():
+    sw = _scaled_window_tensor(feat, meta)
+    if sw is None:
         raise ValueError("Latest window still contains NaNs; wait for more history.")
-
-    ref_close = float(feat["close"].iloc[-1])
-    w = window.reshape(1, seq_len, window.shape[1])
+    w, ref_close = sw
     pred_ret = model.predict(w, verbose=0)[0]
     return {
         "7": ref_close * (1.0 + float(pred_ret[1])),
@@ -282,17 +281,15 @@ def predict_lstm_one_step_with_model(
 ) -> float:
     """
     Next-day (+1) close using an already-loaded Keras model (backtest rollouts call this many times).
+    anchor_close = last row close; predicted_close = anchor_close * (1 + predicted_return).
     """
     seq_len = int(meta["seq_len"])
-    cols: list[str] = meta["feature_cols"]
-    norm, _ = _prepare_lstm_input(feat_df, causal=True)
-    if len(feat_df) < _min_bars_for_lstm(seq_len):
+    if len(feat_df) < min_ohlcv_rows_for_lstm_window(seq_len):
         return float("nan")
-    tail = norm.iloc[-seq_len:][cols].to_numpy(dtype=np.float32)
-    if tail.shape[0] < seq_len or np.isnan(tail).any():
+    sw = _scaled_window_tensor(feat_df, meta)
+    if sw is None:
         return float("nan")
-    ref_close = float(feat_df["close"].astype(float).iloc[-1])
-    w = tail.reshape(1, seq_len, tail.shape[1])
+    w, ref_close = sw
     pred_ret = model.predict(w, verbose=0)[0]
     return ref_close * (1.0 + float(pred_ret[0]))
 
@@ -304,18 +301,14 @@ def predict_lstm_head_prices_with_model(
 ) -> tuple[float, float, float, float]:
     """
     Point estimates for +1, +7, +30, +90 closes (teacher-forced inputs) from the last window.
-    Used for Scenario 4 direction accuracy vs multi-horizon actual moves.
     """
     seq_len = int(meta["seq_len"])
-    cols: list[str] = meta["feature_cols"]
-    norm, _ = _prepare_lstm_input(feat_df, causal=True)
-    if len(feat_df) < _min_bars_for_lstm(seq_len):
+    if len(feat_df) < min_ohlcv_rows_for_lstm_window(seq_len):
         return (float("nan"),) * 4
-    tail = norm.iloc[-seq_len:][cols].to_numpy(dtype=np.float32)
-    if tail.shape[0] < seq_len or np.isnan(tail).any():
+    sw = _scaled_window_tensor(feat_df, meta)
+    if sw is None:
         return (float("nan"),) * 4
-    ref_close = float(feat_df["close"].astype(float).iloc[-1])
-    w = tail.reshape(1, seq_len, tail.shape[1])
+    w, ref_close = sw
     pred_ret = model.predict(w, verbose=0)[0]
     return tuple(ref_close * (1.0 + float(pred_ret[j])) for j in range(4))
 

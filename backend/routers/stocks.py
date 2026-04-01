@@ -165,11 +165,27 @@ def stock_backtest(
         le=5,
         description="1=daily, 2=multi-step honest, 3=stress, 4=direction, 5=combined (one LSTM train)",
     ),
+    years: float | None = Query(
+        None,
+        ge=1,
+        le=80,
+        description="Holdout length in years (min 1 trading-year); omit for BACKTEST_YEARS default. Silently capped by data.",
+    ),
+    max_holdout: bool = Query(
+        False,
+        description="If true, use the longest holdout allowed by cached bars (ignores years).",
+    ),
     db: Session = Depends(get_db),
 ) -> dict:
     t = require_tracked_ticker(ticker)
     try:
-        return run_backtest(db, t, scenario=scenario)
+        return run_backtest(
+            db,
+            t,
+            scenario=scenario,
+            years=years,
+            max_holdout=max_holdout,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001

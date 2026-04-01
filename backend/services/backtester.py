@@ -6,6 +6,7 @@ core ARIMA fitting logic is not modified in arima_model.py — only new local fo
 
 from __future__ import annotations
 
+import logging
 import tempfile
 from pathlib import Path
 
@@ -20,10 +21,14 @@ from services.data_fetcher import get_ohlcv_dataframe
 from services.indicators import add_indicators
 from services.lstm_model import (
     load_trained_lstm_bundle,
+    min_ohlcv_rows_for_lstm_window,
     predict_lstm_head_prices_with_model,
     predict_lstm_one_step_with_model,
     train_lstm_for_ticker,
 )
+from utils.nasdaq100_tickers import get_active_tickers
+
+logger = logging.getLogger(__name__)
 
 # Human-readable labels returned in JSON for each scenario id.
 SCENARIO_LABELS: dict[int, str] = {
@@ -36,8 +41,8 @@ SCENARIO_LABELS: dict[int, str] = {
 
 
 def _lstm_min_input_rows(seq_len: int) -> int:
-    """Matches lstm_model._min_bars_for_lstm: rolling window + sequence length - 1."""
-    return seq_len + settings.LSTM_ROLLING_NORM_WINDOW - 1
+    """Minimum history length for one LSTM window (MinMax inputs; no rolling z warmup)."""
+    return min_ohlcv_rows_for_lstm_window(seq_len)
 
 
 def _norm_w() -> tuple[float, float]:
@@ -87,34 +92,67 @@ def _direction_accuracy(ref: list[float], actual: list[float], pred: list[float]
     return float(ok / tot) if tot > 0 else float("nan")
 
 
-def _holdout_slice(n: int) -> tuple[int, int, int]:
-    """Returns (test_start, hold, target_hold)."""
-    target_hold = settings.BACKTEST_YEARS * 252
+def _holdout_slice(
+    n: int,
+    *,
+    years: float | None = None,
+    max_holdout: bool = False,
+) -> tuple[int, int, int, float | None, float, bool]:
+    """
+    Walk-forward holdout length in trading days; silently capped by available history.
+
+    Returns test_start, hold, requested_trading_days (before cap), holdout_years_requested,
+    holdout_years_actual, max_holdout.
+    """
     min_pre = settings.BACKTEST_MIN_PREHOLDOUT_ROWS
     max_hold_for_lstm = max(0, n - min_pre)
-    max_hold_for_data = n - settings.SEQUENCE_LENGTH - 100
-    hold = min(target_hold, max_hold_for_data, max_hold_for_lstm)
+    max_hold_for_data = max(0, n - settings.SEQUENCE_LENGTH - 100)
+
+    if max_holdout:
+        requested_trading_days = min(max_hold_for_lstm, max_hold_for_data)
+        holdout_years_requested: float | None = None
+        hold = requested_trading_days
+    elif years is not None:
+        y = max(1.0, float(years))
+        requested_trading_days = int(y * 252)
+        holdout_years_requested = y
+        hold = min(requested_trading_days, max_hold_for_lstm, max_hold_for_data)
+    else:
+        y = float(settings.BACKTEST_YEARS)
+        requested_trading_days = int(y * 252)
+        holdout_years_requested = y
+        hold = min(requested_trading_days, max_hold_for_lstm, max_hold_for_data)
+
     if hold < 30:
         raise ValueError(
             f"Not enough history ({n} rows). Need at least ~{min_pre + 30} daily bars "
-            "(refresh prices with enough HISTORY_YEARS) or lower BACKTEST_YEARS / BACKTEST_MIN_PREHOLDOUT_ROWS."
+            "(refresh prices with enough HISTORY_YEARS) or lower BACKTEST_MIN_PREHOLDOUT_ROWS."
         )
     test_start = n - hold
-    return test_start, hold, target_hold
+    holdout_years_actual = hold / 252.0
+    return test_start, hold, requested_trading_days, holdout_years_requested, holdout_years_actual, max_holdout
 
 
-def _holdout_note(hold: int, target_hold: int, min_pre: int) -> str | None:
-    if hold < target_hold:
+def _holdout_note(
+    hold: int,
+    requested_trading_days: int,
+    min_pre: int,
+    *,
+    max_holdout: bool,
+) -> str | None:
+    if max_holdout:
+        return None
+    if hold < requested_trading_days:
         return (
-            f"Holdout reduced from {target_hold} to {hold} trading days so at least "
+            f"Holdout reduced from {requested_trading_days} to {hold} trading days so at least "
             f"{min_pre} rows remain before the test window for LSTM training. "
-            "Fetch more history (HISTORY_YEARS) for a longer 10y-style holdout."
+            "Fetch more history (HISTORY_YEARS) or shorten the years parameter."
         )
     return None
 
 
 def _indicator_frame_for_rollout(ohlcv: pd.DataFrame) -> pd.DataFrame:
-    """Indicators on a growing OHLCV frame; forward-fill only (no bfill) before LSTM causal norm."""
+    """Indicators on a growing OHLCV frame; forward-fill only (no bfill) before LSTM MinMax-scaled features."""
     feat = add_indicators(ohlcv).ffill()
     return feat.fillna(0.0)
 
@@ -234,17 +272,29 @@ def _build_unified_response(
     holdout_note: str | None,
     metrics: dict,
     series: list[dict],
+    holdout_years_requested: float | None,
+    holdout_years_actual: float,
 ) -> dict:
-    return {
+    out = {
         "ticker": ticker,
         "scenario": scenario,
         "scenario_label": SCENARIO_LABELS[scenario],
         "holdout_trading_days": hold,
         "holdout_trading_days_target": target_hold,
         "holdout_note": holdout_note,
+        "holdout_years_requested": holdout_years_requested,
+        "holdout_years_actual": holdout_years_actual,
         "metrics": metrics,
         "series": series,
     }
+    return out
+
+
+def _attach_holdout_years(base: dict, years_req: float | None, years_actual: float) -> dict:
+    """Merge standard holdout year fields into a custom response dict (e.g. Scenario 5)."""
+    base["holdout_years_requested"] = years_req
+    base["holdout_years_actual"] = years_actual
+    return base
 
 
 def _scenario_2_price_metrics_and_series(
@@ -455,21 +505,32 @@ def _combined_verdict_label_and_explanation(
     return verdict, explanation
 
 
-def run_backtest(session: Session, ticker: str, scenario: int = 1) -> dict:
+def run_backtest(
+    session: Session,
+    ticker: str,
+    scenario: int = 1,
+    *,
+    years: float | None = None,
+    max_holdout: bool = False,
+    light: bool = False,
+) -> dict:
     """
-    Run backtest for scenario 1–5. Default scenario=1 (daily one-step, causal LSTM normalization).
+    Run backtest for scenario 1–5. Optional `years` / `max_holdout` control holdout depth (trading years).
 
-    Response always includes a flat `series` list of {date, actual, predicted} for the chart,
-    plus scenario-specific metrics. Scenario 5 adds price_accuracy, direction_accuracy, and verdict fields.
+    `light=True` on Scenario 5 drops heavy series payloads (for bulk admin runs).
     """
     if scenario not in (1, 2, 3, 4, 5):
         raise ValueError("scenario must be 1, 2, 3, 4, or 5")
 
     df = get_ohlcv_dataframe(session, ticker)
     n = len(df)
-    test_start, hold, target_hold = _holdout_slice(n)
+    test_start, hold, requested_days, years_req, years_act, max_h = _holdout_slice(
+        n,
+        years=years,
+        max_holdout=max_holdout,
+    )
     min_pre = settings.BACKTEST_MIN_PREHOLDOUT_ROWS
-    note = _holdout_note(hold, target_hold, min_pre)
+    note = _holdout_note(hold, requested_days, min_pre, max_holdout=max_h)
     train_close = df["close"].iloc[:test_start].to_numpy()
     test_close = df["close"].iloc[test_start:].to_numpy()
     close_all = df["close"].to_numpy(dtype=float)
@@ -484,6 +545,8 @@ def run_backtest(session: Session, ticker: str, scenario: int = 1) -> dict:
     ]
     arima_one_m = _metrics(arima_actual, arima_pred)
 
+    ykw = {"holdout_years_requested": years_req, "holdout_years_actual": years_act}
+
     if scenario == 1:
         return _scenario_1_daily(
             session,
@@ -492,12 +555,13 @@ def run_backtest(session: Session, ticker: str, scenario: int = 1) -> dict:
             n,
             test_start,
             hold,
-            target_hold,
+            requested_days,
             note,
             arima_one_rows,
             arima_one_m,
             wl,
             wa,
+            **ykw,
         )
     if scenario == 2:
         return _scenario_2_multistep(
@@ -507,13 +571,14 @@ def run_backtest(session: Session, ticker: str, scenario: int = 1) -> dict:
             n,
             test_start,
             hold,
-            target_hold,
+            requested_days,
             note,
             arima_one_m,
             close_all,
             wl,
             wa,
             stress_dates=None,
+            **ykw,
         )
     if scenario == 3:
         stress = _stress_trading_date_set(df.index, close_all)
@@ -524,13 +589,14 @@ def run_backtest(session: Session, ticker: str, scenario: int = 1) -> dict:
             n,
             test_start,
             hold,
-            target_hold,
+            requested_days,
             note,
             arima_one_m,
             close_all,
             wl,
             wa,
             stress_dates=stress,
+            **ykw,
         )
     if scenario == 4:
         return _scenario_4_direction(
@@ -540,12 +606,13 @@ def run_backtest(session: Session, ticker: str, scenario: int = 1) -> dict:
             n,
             test_start,
             hold,
-            target_hold,
+            requested_days,
             note,
             arima_one_rows,
             arima_one_m,
             wl,
             wa,
+            **ykw,
         )
     return _scenario_5_combined(
         session,
@@ -554,12 +621,14 @@ def run_backtest(session: Session, ticker: str, scenario: int = 1) -> dict:
         n,
         test_start,
         hold,
-        target_hold,
+        requested_days,
         note,
         arima_one_m,
         close_all,
         wl,
         wa,
+        light=light,
+        **ykw,
     )
 
 
@@ -576,8 +645,11 @@ def _scenario_1_daily(
     arima_one_m: dict,
     wl: float,
     wa: float,
+    *,
+    holdout_years_requested: float | None,
+    holdout_years_actual: float,
 ) -> dict:
-    """Scenario 1: one-step walk-forward; LSTM uses causal rolling norm (no future leakage)."""
+    """Scenario 1: one-step walk-forward; LSTM predicts returns with MinMax-scaled inputs."""
     lstm_series: list[dict] = []
     lstm_m: dict = {"mae": float("nan"), "rmse": float("nan"), "mape": float("nan"), "n": 0.0}
     lstm_err: str | None = None
@@ -645,6 +717,8 @@ def _scenario_1_daily(
         holdout_note=note,
         metrics=metrics,
         series=series,
+        holdout_years_requested=holdout_years_requested,
+        holdout_years_actual=holdout_years_actual,
     )
 
 
@@ -663,6 +737,8 @@ def _scenario_2_multistep(
     wa: float,
     *,
     stress_dates: set[str] | None,
+    holdout_years_requested: float | None,
+    holdout_years_actual: float,
 ) -> dict:
     """
     Scenario 2/3: honest h-day rollout from each anchor (synthetic path). Chart uses BACKTEST_MULTI_STEP_CHART_HORIZON.
@@ -715,6 +791,8 @@ def _scenario_2_multistep(
         holdout_note=note,
         metrics=metrics,
         series=series,
+        holdout_years_requested=holdout_years_requested,
+        holdout_years_actual=holdout_years_actual,
     )
 
 
@@ -731,6 +809,10 @@ def _scenario_5_combined(
     close_all: np.ndarray,
     wl: float,
     wa: float,
+    *,
+    light: bool = False,
+    holdout_years_requested: float | None,
+    holdout_years_actual: float,
 ) -> dict:
     """
     Scenario 5: one LSTM train, then Scenario 2 price metrics/series plus Scenario 4-style direction
@@ -790,13 +872,15 @@ def _scenario_5_combined(
     if combined_err:
         note = (note + " " if note else "") + "Warnings: " + "; ".join(combined_err)
 
-    return {
+    out: dict = {
         "ticker": ticker,
         "scenario": 5,
         "scenario_label": SCENARIO_LABELS[5],
         "holdout_trading_days": hold,
         "holdout_trading_days_target": target_hold,
         "holdout_note": note,
+        "holdout_years_requested": holdout_years_requested,
+        "holdout_years_actual": holdout_years_actual,
         "series": price_series,
         "metrics": {
             "summary": "Use price_accuracy for Scenario 2-style metrics and direction_accuracy for Scenario 4-style stats.",
@@ -809,6 +893,11 @@ def _scenario_5_combined(
         "combined_verdict": verdict,
         "verdict_explanation": explanation,
     }
+    # Bulk admin runs: drop duplicate long series to limit memory.
+    if light:
+        out.pop("series", None)
+        out["price_accuracy"] = {"metrics": price_metrics}
+    return out
 
 
 def _scenario_4_direction(
@@ -824,6 +913,9 @@ def _scenario_4_direction(
     arima_one_m: dict,
     wl: float,
     wa: float,
+    *,
+    holdout_years_requested: float | None,
+    holdout_years_actual: float,
 ) -> dict:
     """Scenario 4: same daily ensemble series as scenario 1, plus directional accuracy (one LSTM train)."""
     lstm_series: list[dict] = []
@@ -930,4 +1022,125 @@ def _scenario_4_direction(
         holdout_note=note,
         metrics=metrics,
         series=series,
+        holdout_years_requested=holdout_years_requested,
+        holdout_years_actual=holdout_years_actual,
     )
+
+
+def run_backtest_all(
+    session: Session,
+    *,
+    scenario: int = 5,
+    years: float | None = None,
+    max_holdout: bool = False,
+) -> dict:
+    """
+    Run `run_backtest` sequentially for every active ticker (LIGHT_MODE-aware).
+    Used by POST /api/admin/backtest-all. Continues on per-ticker failure.
+    """
+    tickers = get_active_tickers()
+    results: dict[str, dict] = {}
+    for sym in tickers:
+        try:
+            r = run_backtest(
+                session,
+                sym,
+                scenario=scenario,
+                years=years,
+                max_holdout=max_holdout,
+                light=True,
+            )
+            pa = r.get("price_accuracy")
+            pm = pa.get("metrics", {}) if isinstance(pa, dict) else {}
+            ens = pm.get("ensemble", {}) if isinstance(pm, dict) else {}
+            h30 = ens.get("h30", {}) if isinstance(ens, dict) else {}
+            mape_30 = (
+                float(h30["mape"])
+                if isinstance(h30, dict) and isinstance(h30.get("mape"), (int, float)) and np.isfinite(h30["mape"])
+                else float("nan")
+            )
+            da = r.get("direction_accuracy", {}) if isinstance(r.get("direction_accuracy"), dict) else {}
+            d7 = float(da.get("direction_accuracy_7d", float("nan")))
+            results[sym] = {
+                "status": "ok",
+                "combined_verdict": r.get("combined_verdict"),
+                "mape_30d": mape_30,
+                "direction_accuracy_7d": d7,
+                "holdout_days": int(r.get("holdout_trading_days", 0)),
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Backtest-all failed for %s", sym)
+            results[sym] = {
+                "status": f"error: {exc}",
+                "combined_verdict": None,
+                "mape_30d": float("nan"),
+                "direction_accuracy_7d": float("nan"),
+                "holdout_days": 0,
+            }
+
+    ok_rows = {k: v for k, v in results.items() if v["status"] == "ok"}
+    mapes = [v["mape_30d"] for v in ok_rows.values() if np.isfinite(v["mape_30d"])]
+    dirs = [v["direction_accuracy_7d"] for v in ok_rows.values() if np.isfinite(v["direction_accuracy_7d"])]
+
+    def _best_by_dir() -> str | None:
+        if not dirs:
+            return None
+        mx = max(dirs)
+        for k, v in ok_rows.items():
+            if np.isfinite(v["direction_accuracy_7d"]) and v["direction_accuracy_7d"] == mx:
+                return k
+        return None
+
+    def _worst_by_dir() -> str | None:
+        if not dirs:
+            return None
+        mn = min(dirs)
+        for k, v in ok_rows.items():
+            if np.isfinite(v["direction_accuracy_7d"]) and v["direction_accuracy_7d"] == mn:
+                return k
+        return None
+
+    avg_mape = float(np.mean(mapes)) if mapes else float("nan")
+    avg_dir = float(np.mean(dirs)) if dirs else float("nan")
+
+    strong: list[str] = []
+    decent: list[str] = []
+    for k, v in ok_rows.items():
+        m = v["mape_30d"]
+        d = v["direction_accuracy_7d"]
+        if np.isfinite(m) and np.isfinite(d):
+            if m < 8.0 and d > 0.57:
+                strong.append(k)
+            elif m < 15.0 and d > 0.53:
+                decent.append(k)
+
+    # Everyone not classified as strong or decent (includes errors and weak ok rows).
+    needs = [k for k in results if k not in strong and k not in decent]
+
+    above_50 = [k for k, v in ok_rows.items() if np.isfinite(v["direction_accuracy_7d"]) and v["direction_accuracy_7d"] > 0.5]
+
+    years_reported: float | None
+    if max_holdout:
+        years_reported = None
+    elif years is not None:
+        years_reported = float(years)
+    else:
+        years_reported = float(settings.BACKTEST_YEARS)
+
+    return {
+        "scenario": scenario,
+        "years": years_reported,
+        "max_holdout": max_holdout,
+        "tickers_tested": tickers,
+        "results": results,
+        "aggregate": {
+            "avg_mape_30d": avg_mape,
+            "avg_direction_accuracy_7d": avg_dir,
+            "best_ticker": _best_by_dir(),
+            "worst_ticker": _worst_by_dir(),
+            "tickers_above_50pct_direction": above_50,
+            "tickers_strong_model": strong,
+            "tickers_decent_model": decent,
+            "tickers_needs_improvement": needs,
+        },
+    }

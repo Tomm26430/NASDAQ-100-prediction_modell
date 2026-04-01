@@ -4,9 +4,12 @@ Operational endpoints (manual cache refresh). Kept separate from public stock ro
 
 import logging
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
+from sqlalchemy.orm import Session
 
 from config import settings
+from models.database import get_db
+from services.backtester import run_backtest_all
 from services.data_fetcher import run_refresh_for_active_tickers
 from services.train_jobs import train_all_active_tickers
 from services.training_status import get_progress, try_begin_training
@@ -74,3 +77,27 @@ def trigger_model_training(background_tasks: BackgroundTasks) -> dict[str, str |
         "status": "accepted",
         "detail": f"Queued training for {n} ticker(s). Poll GET /api/admin/training-status for progress.",
     }
+
+
+@router.post("/backtest-all")
+def admin_backtest_all(
+    scenario: int = Query(5, ge=1, le=5, description="Bulk run currently optimized for scenario 5."),
+    years: float | None = Query(
+        None,
+        ge=1,
+        le=80,
+        description="Holdout years per ticker; default BACKTEST_YEARS when omitted.",
+    ),
+    max_holdout: bool = Query(False, description="Maximize holdout per ticker given cached history."),
+    db: Session = Depends(get_db),
+) -> dict:
+    """
+    Run Scenario 5 (default) backtests sequentially for every active ticker (respects LIGHT_MODE).
+    One ticker failing does not stop the rest; each row includes status ok or error message.
+    """
+    if scenario != 5:
+        raise HTTPException(
+            status_code=400,
+            detail="backtest-all currently supports scenario=5 only.",
+        )
+    return run_backtest_all(db, scenario=scenario, years=years, max_holdout=max_holdout)

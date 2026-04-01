@@ -46,13 +46,15 @@ class Settings(BaseSettings):
     MODEL_DIR: Path = _DEFAULT_MODEL_DIR
 
     # LSTM training (lower for faster dev; raise for production quality)
-    LSTM_EPOCHS: int = 30
+    LSTM_EPOCHS: int = 75
+    LSTM_EARLY_STOPPING_PATIENCE: int = 10
     LSTM_BATCH_SIZE: int = 32
-    LSTM_UNITS: int = 50
-    LSTM_DROPOUT: float = 0.2
+    LSTM_UNITS: int = 100
+    LSTM_DROPOUT: float = 0.25
+    LSTM_LEARNING_RATE: float = 0.0005
     SEQUENCE_LENGTH: int = 60
 
-    # Rolling window (trading days) for per-row z-score normalization of LSTM inputs (replaces global MinMax).
+    # Deprecated: inputs now use MinMaxScaler fit on the training split (kept for env compatibility only).
     LSTM_ROLLING_NORM_WINDOW: int = 252
 
     # Walk-forward holdout length in **trading years** (~252 sessions/year).

@@ -92,6 +92,8 @@ export type BacktestResponse = {
   holdout_trading_days: number;
   holdout_trading_days_target?: number;
   holdout_note?: string | null;
+  holdout_years_requested?: number | null;
+  holdout_years_actual?: number;
   metrics: Record<string, unknown>;
   series: BacktestSeriesRow[];
   /** Scenario 5 only: Scenario 2–style price metrics and series (same single model pass). */
@@ -105,11 +107,51 @@ export type BacktestResponse = {
   verdict_explanation?: string;
 };
 
-export async function fetchBacktest(ticker: string, scenario: number = 1): Promise<BacktestResponse> {
+export type BacktestQueryOpts = {
+  /** Holdout depth in years (min 1). Omit to use server BACKTEST_YEARS default (unless maxHoldout). */
+  years?: number;
+  /** Longest holdout allowed by cached history (ignores years). */
+  maxHoldout?: boolean;
+};
+
+export async function fetchBacktest(
+  ticker: string,
+  scenario: number = 1,
+  opts?: BacktestQueryOpts,
+): Promise<BacktestResponse> {
   const enc = encodeURIComponent(ticker);
-  const { data } = await api.get<BacktestResponse>(`/api/stocks/${enc}/backtest`, {
-    params: { scenario },
-  });
+  const params: Record<string, number | boolean> = { scenario };
+  if (opts?.maxHoldout) params.max_holdout = true;
+  else if (opts?.years != null) params.years = opts.years;
+  const { data } = await api.get<BacktestResponse>(`/api/stocks/${enc}/backtest`, { params });
+  return data;
+}
+
+export type BulkBacktestRow = {
+  status: string;
+  combined_verdict: string | null;
+  mape_30d: number;
+  direction_accuracy_7d: number;
+  holdout_days: number;
+};
+
+export type BulkBacktestResponse = {
+  scenario: number;
+  years: number | null;
+  max_holdout: boolean;
+  tickers_tested: string[];
+  results: Record<string, BulkBacktestRow>;
+  aggregate: Record<string, unknown>;
+};
+
+export async function postBacktestAll(
+  scenario: number = 5,
+  opts?: { years?: number; maxHoldout?: boolean },
+): Promise<BulkBacktestResponse> {
+  const params: Record<string, number | boolean> = { scenario };
+  if (opts?.maxHoldout) params.max_holdout = true;
+  else if (opts?.years != null) params.years = opts.years;
+  const { data } = await api.post<BulkBacktestResponse>("/api/admin/backtest-all", {}, { params });
   return data;
 }
 

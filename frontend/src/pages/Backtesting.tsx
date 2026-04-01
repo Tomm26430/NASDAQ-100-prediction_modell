@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import {
   Bar,
@@ -14,7 +14,27 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
-import { fetchBacktest, type BacktestResponse, type BacktestSeriesRow } from "../api/client";
+import {
+  fetchBacktest,
+  postBacktestAll,
+  type BacktestResponse,
+  type BacktestSeriesRow,
+  type BulkBacktestResponse,
+} from "../api/client";
+
+type HoldYearsPreset = "1" | "3" | "5" | "10" | "max";
+
+function backtestOptsFromPreset(preset: HoldYearsPreset): { years?: number; maxHoldout?: boolean } {
+  if (preset === "max") return { maxHoldout: true };
+  return { years: Number(preset) };
+}
+
+function verdictStyle(verdict: string | null | undefined, status: string): { color: string; fontWeight: number } {
+  if (!status.startsWith("ok")) return { color: "#b91c1c", fontWeight: 600 };
+  if (verdict === "Strong model") return { color: "#15803d", fontWeight: 600 };
+  if (verdict === "Decent model") return { color: "#1d4ed8", fontWeight: 600 };
+  return { color: "#b45309", fontWeight: 500 };
+}
 
 const SCENARIOS = [
   { id: 1, short: "1 — Daily (real inputs)" },
@@ -186,16 +206,22 @@ function Scenario5Panels({ data }: { data: BacktestResponse }) {
 export function Backtesting() {
   const [ticker, setTicker] = useState("AAPL");
   const [scenario, setScenario] = useState(1);
+  const [holdPreset, setHoldPreset] = useState<HoldYearsPreset>("5");
   const [data, setData] = useState<BacktestResponse | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [bulk, setBulk] = useState<BulkBacktestResponse | null>(null);
+  const [bulkErr, setBulkErr] = useState<string | null>(null);
+  const [bulkLoading, setBulkLoading] = useState(false);
+  const [sortKey, setSortKey] = useState<"ticker" | "verdict" | "mape" | "dir" | "status">("ticker");
+  const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
 
   async function run() {
     setLoading(true);
     setErr(null);
     setData(null);
     try {
-      const d = await fetchBacktest(ticker.trim(), scenario);
+      const d = await fetchBacktest(ticker.trim(), scenario, backtestOptsFromPreset(holdPreset));
       setData(d);
     } catch (e: unknown) {
       setErr(e instanceof Error ? e.message : "Backtest failed");
@@ -203,6 +229,53 @@ export function Backtesting() {
       setLoading(false);
     }
   }
+
+  async function runBulk() {
+    setBulkLoading(true);
+    setBulkErr(null);
+    setBulk(null);
+    try {
+      const b = await postBacktestAll(5, backtestOptsFromPreset(holdPreset));
+      setBulk(b);
+    } catch (e: unknown) {
+      setBulkErr(e instanceof Error ? e.message : "Bulk backtest failed");
+    } finally {
+      setBulkLoading(false);
+    }
+  }
+
+  function toggleSort(k: typeof sortKey) {
+    if (sortKey === k) setSortDir((d) => (d === "asc" ? "desc" : "asc"));
+    else {
+      setSortKey(k);
+      setSortDir("asc");
+    }
+  }
+
+  const bulkRows = useMemo(() => {
+    if (!bulk?.results) return [];
+    return Object.entries(bulk.results).map(([t, r]) => ({ ticker: t, ...r }));
+  }, [bulk]);
+
+  const sortedBulkRows = useMemo(() => {
+    const mul = sortDir === "asc" ? 1 : -1;
+    return [...bulkRows].sort((a, b) => {
+      switch (sortKey) {
+        case "ticker":
+          return mul * a.ticker.localeCompare(b.ticker);
+        case "verdict":
+          return mul * String(a.combined_verdict ?? "").localeCompare(String(b.combined_verdict ?? ""));
+        case "mape":
+          return mul * ((a.mape_30d ?? NaN) - (b.mape_30d ?? NaN));
+        case "dir":
+          return mul * ((a.direction_accuracy_7d ?? NaN) - (b.direction_accuracy_7d ?? NaN));
+        case "status":
+          return mul * a.status.localeCompare(b.status);
+        default:
+          return 0;
+      }
+    });
+  }, [bulkRows, sortKey, sortDir]);
 
   const chartData =
     data?.series.map((r) => ({
@@ -218,9 +291,31 @@ export function Backtesting() {
       </p>
       <h1>Backtesting</h1>
       <p style={{ color: "#475569" }}>
-        Walk-forward evaluation on the holdout window (default ~10 trading years). Heavy: may take many minutes,
-        especially scenarios 2–3 and 5 (Scenario 5 runs one LSTM train but both rollout and direction work).
+        Walk-forward evaluation on a configurable holdout window (years below). Heavy: may take many minutes,
+        especially scenarios 2–3 and 5. Retrain LSTMs after pipeline changes (POST /api/admin/train-models).
       </p>
+      <div className="card" style={{ marginBottom: "0.75rem" }}>
+        <span style={{ fontSize: "0.75rem", color: "#64748b", display: "block", marginBottom: 6 }}>Holdout depth</span>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: "0.5rem" }}>
+          {(["1", "3", "5", "10", "max"] as const).map((y) => (
+            <button
+              key={y}
+              type="button"
+              onClick={() => setHoldPreset(y)}
+              style={{
+                padding: "0.35rem 0.65rem",
+                borderRadius: 6,
+                border: holdPreset === y ? "2px solid #2563eb" : "1px solid #cbd5e1",
+                background: holdPreset === y ? "#eff6ff" : "#fff",
+                cursor: "pointer",
+                fontSize: "0.85rem",
+              }}
+            >
+              {y === "max" ? "Max" : `${y}y`}
+            </button>
+          ))}
+        </div>
+      </div>
       <div className="card" style={{ display: "flex", flexWrap: "wrap", gap: "0.75rem", alignItems: "center" }}>
         <label>
           Ticker{" "}
@@ -242,6 +337,9 @@ export function Backtesting() {
         </label>
         <button type="button" onClick={run} disabled={loading}>
           {loading ? "Running…" : "Run backtest"}
+        </button>
+        <button type="button" onClick={runBulk} disabled={bulkLoading} style={{ marginLeft: "0.25rem" }}>
+          {bulkLoading ? "Bulk running…" : "Run bulk test (scenario 5)"}
         </button>
       </div>
       {scenario === 1 && (
@@ -275,6 +373,7 @@ export function Backtesting() {
         </div>
       )}
       {err && <p className="err">{err}</p>}
+      {bulkErr && <p className="err">{bulkErr}</p>}
       {data && (
         <>
           <p style={{ marginTop: "0.75rem", color: "#334155", fontSize: "0.95rem" }}>
@@ -283,6 +382,14 @@ export function Backtesting() {
               <span style={{ color: "#64748b" }}> — chart uses multi-step rollout (see metrics for 7d / 30d / 90d).</span>
             ) : null}
           </p>
+          {data.holdout_years_actual != null && (
+            <p style={{ margin: "0.25rem 0 0", fontSize: "0.85rem", color: "#64748b" }}>
+              Holdout years requested:{" "}
+              {data.holdout_years_requested != null ? data.holdout_years_requested : "max (full cache)"} · actual:{" "}
+              {typeof data.holdout_years_actual === "number" ? data.holdout_years_actual.toFixed(2) : "—"} (
+              {data.holdout_trading_days} trading days)
+            </p>
+          )}
           {data.holdout_note && (
             <div className="card" style={{ background: "#fffbeb", border: "1px solid #fcd34d" }}>
               <p style={{ margin: 0, fontSize: "0.9rem", color: "#92400e" }}>{data.holdout_note}</p>
@@ -324,6 +431,63 @@ export function Backtesting() {
             </>
           )}
         </>
+      )}
+      {bulk && (
+        <div className="card" style={{ marginTop: "1.25rem" }}>
+          <h2 style={{ marginTop: 0, fontSize: "1rem" }}>Bulk backtest (active tickers)</h2>
+          <p style={{ fontSize: "0.85rem", color: "#64748b" }}>
+            Scenario {bulk.scenario}, years param: {bulk.years == null ? "max holdout" : bulk.years} · tested{" "}
+            {bulk.tickers_tested.length} symbols.
+          </p>
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ width: "100%", fontSize: "0.8rem", borderCollapse: "collapse" }}>
+              <thead>
+                <tr style={{ textAlign: "left", borderBottom: "1px solid #e2e8f0" }}>
+                  <th style={{ padding: 6, cursor: "pointer" }} onClick={() => toggleSort("ticker")}>
+                    Ticker {sortKey === "ticker" ? (sortDir === "asc" ? "↑" : "↓") : ""}
+                  </th>
+                  <th style={{ padding: 6, cursor: "pointer" }} onClick={() => toggleSort("verdict")}>
+                    Verdict {sortKey === "verdict" ? (sortDir === "asc" ? "↑" : "↓") : ""}
+                  </th>
+                  <th style={{ padding: 6, cursor: "pointer" }} onClick={() => toggleSort("mape")}>
+                    MAPE 30d {sortKey === "mape" ? (sortDir === "asc" ? "↑" : "↓") : ""}
+                  </th>
+                  <th style={{ padding: 6, cursor: "pointer" }} onClick={() => toggleSort("dir")}>
+                    Dir 7d {sortKey === "dir" ? (sortDir === "asc" ? "↑" : "↓") : ""}
+                  </th>
+                  <th style={{ padding: 6, cursor: "pointer" }} onClick={() => toggleSort("status")}>
+                    Status {sortKey === "status" ? (sortDir === "asc" ? "↑" : "↓") : ""}
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                {sortedBulkRows.map((row) => {
+                  const st = verdictStyle(row.combined_verdict, row.status);
+                  return (
+                    <tr key={row.ticker} style={{ borderBottom: "1px solid #f1f5f9" }}>
+                      <td style={{ padding: 6 }}>{row.ticker}</td>
+                      <td style={{ padding: 6, ...st }}>{row.combined_verdict ?? "—"}</td>
+                      <td style={{ padding: 6 }}>
+                        {Number.isFinite(row.mape_30d) ? `${row.mape_30d.toFixed(2)}%` : "—"}
+                      </td>
+                      <td style={{ padding: 6 }}>
+                        {Number.isFinite(row.direction_accuracy_7d)
+                          ? `${(row.direction_accuracy_7d * 100).toFixed(1)}%`
+                          : "—"}
+                      </td>
+                      <td style={{ padding: 6, fontSize: "0.75rem", color: row.status === "ok" ? "#334155" : "#b91c1c" }}>
+                        {row.status}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+          <pre style={{ fontSize: "0.7rem", marginTop: "0.75rem", overflow: "auto", maxHeight: 200 }}>
+            {JSON.stringify(bulk.aggregate, null, 2)}
+          </pre>
+        </div>
       )}
     </main>
   );

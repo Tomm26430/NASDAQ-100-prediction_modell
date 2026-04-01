@@ -18,10 +18,10 @@ Complete instructions from first install through daily use, API usage, and troub
 | [8. Loading and updating price data](#toc-8) | Yahoo Finance cache, refresh, scheduler |
 | [9. Training machine learning models](#toc-9) | LSTM + ARIMA, artifacts, time expectations |
 | [10. Starting the frontend](#toc-10) | Vite dev server and API proxy |
-| [11. Using the web application](#toc-11) | Dashboard, stock analysis, backtesting |
+| [11. Using the web application](#toc-11) | Dashboard, stock analysis, backtest + bulk |
 | [12. API reference](#toc-12) | All HTTP routes and typical responses |
 | [13. Predictions and ensemble logic](#toc-13) | Horizons, weights, when predictions fail |
-| [14. Backtesting](#toc-14) | What it measures and runtime |
+| [14. Backtesting](#toc-14) | Scenarios, holdout controls, and runtime |
 | [15. Nasdaq-100 index shortcut](#toc-15) | `/api/index/ndx` |
 | [16. Shutting everything down](#toc-16) | Clean stop |
 | [17. Important file locations](#toc-17) | Paths on disk |
@@ -39,7 +39,7 @@ The **NASDAQ Predictor** is a local full-stack tool that:
 1. **Downloads and caches** daily OHLCV (open, high, low, close, volume) for Nasdaq-100 constituents and the **Nasdaq-100 index** (`^NDX`) via Yahoo Finance (`yfinance`).
 2. **Computes technical indicators**: RSI(14), MACD(12/26/9), Bollinger Bands (20, 2σ).
 3. **Trains per-symbol models**:
-   - **LSTM** (TensorFlow/Keras) for multi-horizon closes.
+   - **LSTM** (TensorFlow/Keras) for multi-horizon **returns** (1/7/30/90-day heads), converted back to prices from the anchor close.
    - **Auto-ARIMA** (`pmdarima`) on log closes; forecasts are **refit from cached data** when you request a prediction so they stay aligned with the latest bars.
 4. **Blends** LSTM and ARIMA into an **ensemble** (default **60% LSTM / 40% ARIMA**) with simple confidence-style bands.
 5. **Backtests** on a recent holdout window (walk-forward style evaluation; can take around a minute per run).
@@ -151,8 +151,8 @@ LIGHT_MODE=false
 | `CORS_ORIGINS` | Comma-separated browser origins allowed to call the API (includes Vite URLs by default). |
 | `PRICE_REFRESH_INTERVAL_HOURS` | Background scheduler interval for automatic price refresh of **active** tickers. |
 | `MODEL_DIR` | Directory for saved LSTM/ARIMA artifacts (default `backend/saved_models/`). |
-| `LSTM_EPOCHS`, `LSTM_BATCH_SIZE`, `LSTM_UNITS`, `LSTM_DROPOUT`, `SEQUENCE_LENGTH` | LSTM training hyperparameters. |
-| `LSTM_ROLLING_NORM_WINDOW` | Trailing trading days for **rolling z-score** on LSTM inputs (default **252**); replaces global MinMax. |
+| `LSTM_EPOCHS`, `LSTM_EARLY_STOPPING_PATIENCE`, `LSTM_BATCH_SIZE`, `LSTM_UNITS`, `LSTM_DROPOUT`, `LSTM_LEARNING_RATE`, `SEQUENCE_LENGTH` | LSTM training hyperparameters (defaults tuned for longer training with early stopping). |
+| `LSTM_ROLLING_NORM_WINDOW` | Legacy compatibility setting (unused by the current return-based LSTM input pipeline). |
 | `BACKTEST_YEARS` | Backtest walk-forward holdout length in **trading years** (default **10**, ≈2520 trading days; capped by cached data). |
 | `BACKTEST_MIN_PREHOLDOUT_ROWS` | Minimum daily bars **before** the holdout reserved for training the temporary LSTM (default **650**). If total history is short, the holdout is shortened automatically so LSTM training still has enough clean rows. |
 | `ENSEMBLE_WEIGHT_LSTM`, `ENSEMBLE_WEIGHT_ARIMA` | Ensemble blend weights (normalized when combined). |
@@ -261,7 +261,8 @@ The backend also runs a **scheduled** refresh on an interval (`PRICE_REFRESH_INT
 ### 9.1 Why training is required
 
 - **GET `/api/stocks/{ticker}/prediction`** and **GET `/api/index/ndx`** require a **saved LSTM** for that symbol under `backend/saved_models/`.
-- The **LSTM** learns **cumulative simple returns** (vs the last bar in each window) and uses **rolling z-score** inputs (`LSTM_ROLLING_NORM_WINDOW`, default 252 trading days), not raw prices or a single global MinMax fit.
+- The **LSTM** learns **cumulative simple returns** `(close[t+h]/close[t]) - 1` and converts predicted returns back to prices using the anchor close.
+- LSTM input features use **MinMaxScaler**, fit on the training split only and saved in model metadata.
 - **ARIMA** training saves a pickle for bookkeeping; **live predictions** refit ARIMA from the **current** SQLite series when you call the prediction endpoint.
 
 ### 9.2 How to train
@@ -286,6 +287,7 @@ The backend also runs a **scheduled** refresh on an interval (`PRICE_REFRESH_INT
 
 - Reload the **Dashboard** or open **Analysis** for a symbol.
 - If prediction still fails, check that this ticker’s LSTM files exist in `backend/saved_models/` and read the error message in the API response.
+- If model files were trained before the return-based pipeline update, run a full retrain so incompatible checkpoints are replaced.
 
 ---
 
@@ -320,6 +322,7 @@ Ensure the **backend** is still running on **port 8000** so the **proxy** for `/
 - For a subset of symbols that have prices, the UI may attempt to load **7-day ensemble** estimates (requires trained LSTM for those symbols).
 - **Refresh prices** → `POST /api/admin/refresh`
 - **Train models** → `POST /api/admin/train-models`
+- **Training progress** card polls `GET /api/admin/training-status` (state, percent, current ticker/step).
 - **Analysis** → opens the stock detail route for that ticker.
 
 ### 11.2 Stock analysis (`/stock/{ticker}`)
@@ -332,9 +335,18 @@ Ensure the **backend** is still running on **port 8000** so the **proxy** for `/
 
 ### 11.3 Backtesting (`/backtest`)
 
-- Enter a **ticker** and run **Run backtest** → **`GET /api/stocks/{ticker}/backtest`**
-- Shows **metrics** (MAE, RMSE, MAPE, sample counts) and a chart of **ensemble vs actual** where dates align.
-- Expect **roughly up to a minute** per run; do not spam-click.
+- Select holdout presets **1y / 3y / 5y / 10y / Max** (default **5y** in the UI).
+- Enter a **ticker** and run **Run backtest** → **`GET /api/stocks/{ticker}/backtest`**.
+- Scenario picker supports:
+  - **1:** Daily prediction accuracy (optimistic; uses realized daily inputs)
+  - **2:** Forward-looking honest multi-step rollout
+  - **3:** Stress-window subset of scenario 2
+  - **4:** Direction accuracy focus
+  - **5:** Combined honest assessment (single LSTM training pass for price + direction outputs)
+- Responses include `holdout_years_requested` and `holdout_years_actual` (actual is silently capped by available data).
+- **Run bulk test (scenario 5)** calls `POST /api/admin/backtest-all` and shows a sortable table:
+  `Ticker | Verdict | MAPE 30d | Direction 7d | Status`.
+- Expect heavy runs to take a while; avoid repeated clicks during active processing.
 
 ---
 
@@ -352,10 +364,12 @@ Base URL (direct to backend): `http://127.0.0.1:8000`
 | GET | `/api/stocks/{ticker}/history` | OHLCV bars (optional `limit` query). |
 | GET | `/api/stocks/{ticker}/indicators` | Indicator series for charts (optional `limit`). |
 | GET | `/api/stocks/{ticker}/prediction` | Ensemble 7/30/90d forecast (needs LSTM). |
-| GET | `/api/stocks/{ticker}/backtest` | Backtest metrics + series. |
+| GET | `/api/stocks/{ticker}/backtest` | Backtest metrics + series (`scenario`, optional `years`, optional `max_holdout`). |
 | GET | `/api/index/ndx` | Same ensemble JSON as `^NDX` prediction route. |
 | POST | `/api/admin/refresh` | Background Yahoo refresh for **active** tickers. |
 | POST | `/api/admin/train-models` | Background LSTM + ARIMA train for **active** tickers. |
+| GET | `/api/admin/training-status` | Training progress (`idle/running/completed/error`, percent, current ticker/step). |
+| POST | `/api/admin/backtest-all` | Sequential bulk scenario-5 backtest across active tickers with aggregate summary. |
 
 Unknown tickers (not in the configured universe) return **404** from the stock routes.
 
@@ -377,9 +391,17 @@ Unknown tickers (not in the configured universe) return **404** from the stock r
 
 ## 14. Backtesting
 
-- Uses a **holdout** of roughly **`BACKTEST_YEARS`** (default **10** trading years, ≈2520 sessions) at the end of the cached series, capped if you have fewer bars or if the series is too short to keep both a long holdout and at least **`BACKTEST_MIN_PREHOLDOUT_ROWS`** bars for LSTM training (see env table). **Re-fetch prices** after raising `HISTORY_YEARS` so SQLite has enough history for a full 10y-style holdout.
+- Endpoint: **`GET /api/stocks/{ticker}/backtest?scenario=...&years=...&max_holdout=...`**
+- Holdout depth rules:
+  - `years` is optional (minimum 1 year / ~252 trading days)
+  - omitted `years` uses `BACKTEST_YEARS`
+  - `max_holdout=true` uses the longest holdout allowed by cached data (ignores `years`)
+  - holdout is silently capped to keep enough pre-holdout rows for LSTM training
+  - response returns both `holdout_years_requested` and `holdout_years_actual`
 - **ARIMA:** one-step walk-forward updates on the test segment.
-- **LSTM:** trained **only** on data **before** the holdout into a **temporary** folder so your main `saved_models/` checkpoints are not overwritten; then one-step-style evaluation over the holdout with **actual** indicator history (teacher forcing).
+- **LSTM:** trained only on data before holdout into a temporary folder; evaluated one-step or multi-step depending on scenario.
+- **Scenario 5:** combines scenario-2 price metrics and scenario-4 direction metrics in one pass, then adds a verdict.
+- **Bulk mode:** `POST /api/admin/backtest-all?scenario=5&years=5` runs sequentially per active ticker, continues on failures, and returns aggregate stats.
 - **Ensemble series** aligns dates where both model streams exist.
 
 If you see TensorFlow **retracing** warnings in the log during backtests, they are a known performance warning and do not necessarily mean wrong numbers.
@@ -434,8 +456,11 @@ SQLite and `saved_models/` persist on disk for the next run.
 | UI loads but **no data** / errors on fetch | Backend running on **8000**? Vite proxy unchanged? Browser console for failed `/api` calls. |
 | **`/health` works** but `/api/stocks` has all **null** prices | Run **POST `/api/admin/refresh`**; confirm `LIGHT_MODE` and **active** tickers; wait for background job. |
 | **Prediction** returns **400** / train first | Run **POST `/api/admin/train-models`**; wait; confirm `*_lstm.keras` exists for that ticker. |
+| Training appears stalled | Check **GET `/api/admin/training-status`** (or Dashboard progress card) for state/current ticker/step. |
 | **404** on a ticker | Symbol must be in the app’s **tracked universe** (see `backend/utils/nasdaq100_tickers.py`). |
-| **Backtest** slow or timeout | Expected; reduce load by testing **light-mode** tickers first. |
+| Requested holdout years not honored exactly | Expected when history is insufficient; inspect `holdout_years_actual` and `holdout_note` in the response. |
+| Bulk backtest has partial failures | Expected behavior: failures are reported in per-ticker `status`; other tickers continue. |
+| **Backtest** slow or timeout | Expected; reduce holdout years, use light-mode tickers first, or run scenario 5 bulk only. |
 | **TensorFlow / pip** errors on install | Python version vs. available wheels; try another Python (e.g. 3.11) in a fresh venv. |
 | **CORS** errors (if you change ports) | Add your new origin to `CORS_ORIGINS` in config / `.env`. |
 
