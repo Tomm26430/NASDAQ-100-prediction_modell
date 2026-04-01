@@ -78,30 +78,38 @@ export async function fetchPrediction(ticker: string): Promise<PredictionRespons
   return data;
 }
 
-export type BacktestResponse = {
-  ticker: string;
-  holdout_trading_days: number;
-  metrics: {
-    arima_one_step: Record<string, number>;
-    lstm_one_step: Record<string, number>;
-    ensemble: Record<string, number>;
-  };
-  series: {
-    arima: { date: string; actual: number; predicted: number }[];
-    lstm: { date: string; actual: number; predicted: number }[];
-    ensemble: {
-      date: string;
-      actual: number;
-      predicted_ensemble: number;
-      predicted_lstm: number;
-      predicted_arima: number;
-    }[];
-  };
+/** One row per chart point; `predicted` is the ensemble (or scenario-specific) forecast vs `actual`. */
+export type BacktestSeriesRow = {
+  date: string;
+  actual: number;
+  predicted: number;
 };
 
-export async function fetchBacktest(ticker: string): Promise<BacktestResponse> {
+export type BacktestResponse = {
+  ticker: string;
+  scenario: number;
+  scenario_label: string;
+  holdout_trading_days: number;
+  holdout_trading_days_target?: number;
+  holdout_note?: string | null;
+  metrics: Record<string, unknown>;
+  series: BacktestSeriesRow[];
+  /** Scenario 5 only: Scenario 2–style price metrics and series (same single model pass). */
+  price_accuracy?: {
+    metrics: Record<string, unknown>;
+    series: BacktestSeriesRow[];
+  };
+  /** Scenario 5 only: direction hit rates (fractions 0–1) plus headline_7d_percent (0–100). */
+  direction_accuracy?: Record<string, unknown>;
+  combined_verdict?: string;
+  verdict_explanation?: string;
+};
+
+export async function fetchBacktest(ticker: string, scenario: number = 1): Promise<BacktestResponse> {
   const enc = encodeURIComponent(ticker);
-  const { data } = await api.get<BacktestResponse>(`/api/stocks/${enc}/backtest`);
+  const { data } = await api.get<BacktestResponse>(`/api/stocks/${enc}/backtest`, {
+    params: { scenario },
+  });
   return data;
 }
 
@@ -109,6 +117,28 @@ export async function postRefresh(): Promise<void> {
   await api.post("/api/admin/refresh");
 }
 
-export async function postTrainModels(): Promise<void> {
-  await api.post("/api/admin/train-models");
+export type TrainingStatusResponse = {
+  state: "idle" | "running" | "completed" | "error";
+  total_tickers: number;
+  completed_tickers: number;
+  steps_total: number;
+  steps_done: number;
+  percent: number;
+  current_ticker: string | null;
+  current_step: string | null;
+  message: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  tickers_queue: string[];
+  last_results: unknown[];
+};
+
+export async function fetchTrainingStatus(): Promise<TrainingStatusResponse> {
+  const { data } = await api.get<TrainingStatusResponse>("/api/admin/training-status");
+  return data;
+}
+
+export async function postTrainModels(): Promise<{ status: string; detail: string }> {
+  const { data } = await api.post<{ status: string; detail: string }>("/api/admin/train-models");
+  return data;
 }

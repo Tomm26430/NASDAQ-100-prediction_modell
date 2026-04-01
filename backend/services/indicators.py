@@ -48,7 +48,7 @@ def add_indicators(ohlcv: pd.DataFrame) -> pd.DataFrame:
 
 
 def feature_columns() -> list[str]:
-    """Column order fed into the LSTM after scaling."""
+    """Legacy OHLCV + indicator names (charts); LSTM uses `lstm_feature_columns` in `lstm_model`."""
     return [
         "close",
         "volume",

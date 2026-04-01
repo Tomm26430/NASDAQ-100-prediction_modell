@@ -4,16 +4,27 @@ Operational endpoints (manual cache refresh). Kept separate from public stock ro
 
 import logging
 
-from fastapi import APIRouter, BackgroundTasks
+from fastapi import APIRouter, BackgroundTasks, HTTPException
 
 from config import settings
 from services.data_fetcher import run_refresh_for_active_tickers
 from services.train_jobs import train_all_active_tickers
+from services.training_status import get_progress, try_begin_training
 from utils.nasdaq100_tickers import get_active_tickers
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/admin", tags=["admin"])
+
+
+@router.get("/training-status")
+def training_status_endpoint() -> dict:
+    """
+    Poll this while training runs: percent, current ticker/step, and completion state.
+
+    States: `idle` | `running` | `completed` | `error`
+    """
+    return get_progress()
 
 
 @router.post("/refresh")
@@ -44,16 +55,22 @@ def trigger_model_training(background_tasks: BackgroundTasks) -> dict[str, str |
     """
     Train LSTM + ARIMA checkpoints for every active ticker (respects LIGHT_MODE).
 
-    This can take several minutes even in light mode; runs after the HTTP response returns.
+    Returns 409 if a training job is already running. Poll GET /api/admin/training-status for progress.
     """
+    tickers = get_active_tickers()
+    if not try_begin_training(tickers):
+        raise HTTPException(
+            status_code=409,
+            detail="Training is already in progress. Wait for it to finish or check GET /api/admin/training-status.",
+        )
 
     def _run() -> None:
         summary = train_all_active_tickers()
         logger.info("Training finished for %s tickers", len(summary))
 
     background_tasks.add_task(_run)
-    n = len(get_active_tickers())
+    n = len(tickers)
     return {
         "status": "accepted",
-        "detail": f"Queued training for {n} ticker(s). Watch logs; then call GET /api/stocks/{{ticker}}/prediction.",
+        "detail": f"Queued training for {n} ticker(s). Poll GET /api/admin/training-status for progress.",
     }

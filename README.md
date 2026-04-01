@@ -147,12 +147,14 @@ LIGHT_MODE=false
 | Variable | Purpose |
 |----------|---------|
 | `DATABASE_URL` | SQLite URL (default: file `nasdaq_predictor.db` under `backend/`). |
-| `HISTORY_YEARS` | Years of daily history requested from Yahoo when refreshing a symbol. |
+| `HISTORY_YEARS` | Years of daily history requested from Yahoo when refreshing a symbol (default **12** so 10y backtests have enough pre-holdout data). |
 | `CORS_ORIGINS` | Comma-separated browser origins allowed to call the API (includes Vite URLs by default). |
 | `PRICE_REFRESH_INTERVAL_HOURS` | Background scheduler interval for automatic price refresh of **active** tickers. |
 | `MODEL_DIR` | Directory for saved LSTM/ARIMA artifacts (default `backend/saved_models/`). |
 | `LSTM_EPOCHS`, `LSTM_BATCH_SIZE`, `LSTM_UNITS`, `LSTM_DROPOUT`, `SEQUENCE_LENGTH` | LSTM training hyperparameters. |
-| `BACKTEST_TRADING_DAYS` | Approximate length of the backtest holdout (trading days). |
+| `LSTM_ROLLING_NORM_WINDOW` | Trailing trading days for **rolling z-score** on LSTM inputs (default **252**); replaces global MinMax. |
+| `BACKTEST_YEARS` | Backtest walk-forward holdout length in **trading years** (default **10**, ≈2520 trading days; capped by cached data). |
+| `BACKTEST_MIN_PREHOLDOUT_ROWS` | Minimum daily bars **before** the holdout reserved for training the temporary LSTM (default **650**). If total history is short, the holdout is shortened automatically so LSTM training still has enough clean rows. |
 | `ENSEMBLE_WEIGHT_LSTM`, `ENSEMBLE_WEIGHT_ARIMA` | Ensemble blend weights (normalized when combined). |
 
 ---
@@ -259,6 +261,7 @@ The backend also runs a **scheduled** refresh on an interval (`PRICE_REFRESH_INT
 ### 9.1 Why training is required
 
 - **GET `/api/stocks/{ticker}/prediction`** and **GET `/api/index/ndx`** require a **saved LSTM** for that symbol under `backend/saved_models/`.
+- The **LSTM** learns **cumulative simple returns** (vs the last bar in each window) and uses **rolling z-score** inputs (`LSTM_ROLLING_NORM_WINDOW`, default 252 trading days), not raw prices or a single global MinMax fit.
 - **ARIMA** training saves a pickle for bookkeeping; **live predictions** refit ARIMA from the **current** SQLite series when you call the prediction endpoint.
 
 ### 9.2 How to train
@@ -374,7 +377,7 @@ Unknown tickers (not in the configured universe) return **404** from the stock r
 
 ## 14. Backtesting
 
-- Uses a **holdout** of roughly **`BACKTEST_TRADING_DAYS`** (default ~252 trading days) at the end of the cached series.
+- Uses a **holdout** of roughly **`BACKTEST_YEARS`** (default **10** trading years, ≈2520 sessions) at the end of the cached series, capped if you have fewer bars or if the series is too short to keep both a long holdout and at least **`BACKTEST_MIN_PREHOLDOUT_ROWS`** bars for LSTM training (see env table). **Re-fetch prices** after raising `HISTORY_YEARS` so SQLite has enough history for a full 10y-style holdout.
 - **ARIMA:** one-step walk-forward updates on the test segment.
 - **LSTM:** trained **only** on data **before** the holdout into a **temporary** folder so your main `saved_models/` checkpoints are not overwritten; then one-step-style evaluation over the holdout with **actual** indicator history (teacher forcing).
 - **Ensemble series** aligns dates where both model streams exist.

@@ -33,7 +33,8 @@ class Settings(BaseSettings):
     DATABASE_URL: str = f"sqlite:///{_DEFAULT_DB}"
 
     # How many years of daily bars to request from Yahoo Finance.
-    HISTORY_YEARS: int = 5
+    # Use at least BACKTEST_YEARS + ~2 so the backtest has enough pre-holdout history for training.
+    HISTORY_YEARS: int = 12
 
     # CORS: allow the Vite dev server and typical local frontends.
     CORS_ORIGINS: str = "http://localhost:5173,http://127.0.0.1:5173"
@@ -51,8 +52,26 @@ class Settings(BaseSettings):
     LSTM_DROPOUT: float = 0.2
     SEQUENCE_LENGTH: int = 60
 
-    # Walk-forward / holdout length (~1 trading year)
-    BACKTEST_TRADING_DAYS: int = 252
+    # Rolling window (trading days) for per-row z-score normalization of LSTM inputs (replaces global MinMax).
+    LSTM_ROLLING_NORM_WINDOW: int = 252
+
+    # Walk-forward holdout length in **trading years** (~252 sessions/year).
+    # 10 years ≈ 2520 trading days in the test window (capped by available data).
+    BACKTEST_YEARS: int = 10
+
+    # Minimum daily rows *before* the holdout so the temporary backtest LSTM can train
+    # (needs hundreds of sliding windows; must be < total bars minus holdout).
+    BACKTEST_MIN_PREHOLDOUT_ROWS: int = 650
+
+    # Scenario 2/3: spacing between rollout anchors (trading days) to limit runtime (90 LSTM steps each).
+    BACKTEST_SCENARIO2_ANCHOR_STRIDE: int = 10
+
+    # Scenario 4: only compute direction (3× ARIMA refits + LSTM heads) every N anchor days — full daily series still runs each day.
+    BACKTEST_SCENARIO4_DIRECTION_STRIDE: int = 10
+
+    # Primary horizon (trading days) for Scenario 2/3 chart `predicted` vs actual (7/30/90 metrics still computed).
+    # Must be one of 7, 30, 90 so it matches a rollout head.
+    BACKTEST_MULTI_STEP_CHART_HORIZON: int = 30
 
     # Ensemble weights (LSTM, ARIMA)
     ENSEMBLE_WEIGHT_LSTM: float = 0.6

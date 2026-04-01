@@ -157,10 +157,19 @@ def stock_prediction(ticker: str, db: Session = Depends(get_db)) -> dict:
 
 
 @router.get("/stocks/{ticker}/backtest")
-def stock_backtest(ticker: str, db: Session = Depends(get_db)) -> dict:
+def stock_backtest(
+    ticker: str,
+    scenario: int = Query(
+        1,
+        ge=1,
+        le=5,
+        description="1=daily, 2=multi-step honest, 3=stress, 4=direction, 5=combined (one LSTM train)",
+    ),
+    db: Session = Depends(get_db),
+) -> dict:
     t = require_tracked_ticker(ticker)
     try:
-        return run_backtest(db, t)
+        return run_backtest(db, t, scenario=scenario)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001

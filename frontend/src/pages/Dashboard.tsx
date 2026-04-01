@@ -1,6 +1,16 @@
+import axios from "axios";
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { fetchPrediction, fetchStockList, postRefresh, postTrainModels, type StockRow } from "../api/client";
+import {
+  fetchPrediction,
+  fetchStockList,
+  fetchTrainingStatus,
+  postRefresh,
+  postTrainModels,
+  type StockRow,
+  type TrainingStatusResponse,
+} from "../api/client";
+import { TrainingProgress } from "../components/TrainingProgress";
 
 type RowExtra = StockRow & { pred7?: number | null; predErr?: string };
 
@@ -11,6 +21,21 @@ export function Dashboard() {
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
+  const [trainingStatus, setTrainingStatus] = useState<TrainingStatusResponse | null>(null);
+
+  useEffect(() => {
+    const poll = async () => {
+      try {
+        const s = await fetchTrainingStatus();
+        setTrainingStatus(s);
+      } catch {
+        /* ignore poll errors */
+      }
+    };
+    void poll();
+    const id = setInterval(poll, 1500);
+    return () => clearInterval(id);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -60,11 +85,16 @@ export function Dashboard() {
 
   async function onTrain() {
     try {
-      setBusy("Training queued (check terminal logs)…");
-      await postTrainModels();
-      setBusy("Training started. Wait several minutes, then reload.");
+      setBusy(null);
+      const res = await postTrainModels();
+      setBusy(res.detail);
     } catch (e: unknown) {
-      setBusy(e instanceof Error ? e.message : "Train request failed");
+      if (axios.isAxiosError(e) && e.response?.status === 409) {
+        const d = e.response?.data as { detail?: string };
+        setBusy(d?.detail ?? "Training already in progress.");
+      } else {
+        setBusy(e instanceof Error ? e.message : "Train request failed");
+      }
     }
   }
 
@@ -84,7 +114,8 @@ export function Dashboard() {
           Train models (active tickers)
         </button>
       </div>
-      {busy && <p className="err">{busy}</p>}
+      <TrainingProgress status={trainingStatus} />
+      {busy && <p style={{ color: "#475569", fontSize: "0.9rem" }}>{busy}</p>}
       {err && <p className="err">{err}</p>}
       {loading && <p>Loading…</p>}
       {!loading && !err && (
