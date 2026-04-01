@@ -1,4 +1,4 @@
-# NASDAQ Predictor — User Guide 
+# NASDAQ Predictor — User Guide
 
 Complete instructions from first install through daily use, API usage, and troubleshooting.
 
