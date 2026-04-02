@@ -57,6 +57,25 @@ class AppMeta(Base):
     value: Mapped[str] = mapped_column(String(256), nullable=False)
 
 
+class MacroDaily(Base):
+    """
+    One row per calendar date: aligned macro market inputs (VIX, yields, dollar, oil, S&P).
+
+    Column set matches config.MACRO_FEATURE_COLUMNS (see also fetch_macro_features).
+    """
+
+    __tablename__ = "macro_daily"
+    __table_args__ = (UniqueConstraint("trade_date", name="uq_macro_trade_date"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    trade_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    vix: Mapped[float | None] = mapped_column(Float, nullable=True)
+    treasury_10y: Mapped[float | None] = mapped_column(Float, nullable=True)
+    dollar_index: Mapped[float | None] = mapped_column(Float, nullable=True)
+    oil_wti: Mapped[float | None] = mapped_column(Float, nullable=True)
+    sp500_close: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+
 class BacktestRun(Base):
     """
     One saved backtest session (single-ticker run or bulk multi-ticker run).

@@ -17,29 +17,33 @@ Scope note:
 
 #### `backend/models/`
 - `backend/models/__init__.py`: Package marker.
-- `backend/models/database.py`: SQLAlchemy models (`PriceBar`, `AppMeta`) and session/engine helpers.
+- `backend/models/database.py`: SQLAlchemy models (`PriceBar`, `AppMeta`, `MacroDaily`, `BacktestRun`, `BacktestTickerResult`) and session/engine helpers.
 
 #### `backend/routers/`
 - `backend/routers/__init__.py`: Router package marker.
 - `backend/routers/stocks.py`: Public stock routes (list, history, indicators, prediction, backtest).
-- `backend/routers/admin.py`: Admin routes (refresh, training, training status, bulk backtest).
+- `backend/routers/admin.py`: Admin routes (refresh + refresh status, training + training status, bulk backtest + backtest status).
+- `backend/routers/backtest_runs.py`: Saved run list/detail/compare/delete (`/api/backtest-runs/...`).
 
 #### `backend/services/`
 - `backend/services/__init__.py`: Services package marker.
-- `backend/services/data_fetcher.py`: Yahoo Finance downloads + SQLite caching + “load as DataFrame” helpers.
-- `backend/services/indicators.py`: RSI/MACD/Bollinger computations (used for charts and ML features).
+- `backend/services/data_fetcher.py`: Yahoo Finance downloads + SQLite caching + “load as DataFrame” helpers + **`fetch_macro_features` / `get_macro_dataframe`** for `macro_daily`.
+- `backend/services/indicators.py`: RSI/MACD/Bollinger computations + **`merge_macro_features`** (rolling macro normalization) and **`macro_feature_columns`**.
 - `backend/services/lstm_model.py`: LSTM feature engineering, training, saving/loading artifacts, inference helpers.
 - `backend/services/arima_model.py`: Auto-ARIMA training and refit-at-prediction helpers, plus one-step walk-forward.
 - `backend/services/ensemble.py`: Blends LSTM and ARIMA outputs and creates confidence bands.
-- `backend/services/backtester.py`: Backtest engine implementing scenarios 1–5 plus bulk runner.
+- `backend/services/backtester.py`: Backtest engine implementing scenarios 1–5 plus bulk runner (macro-aware feature frames and rollouts).
 - `backend/services/train_jobs.py`: Batch training loop over active tickers (LSTM then ARIMA).
 - `backend/services/training_status.py`: Thread-safe in-memory training progress for UI polling.
+- `backend/services/refresh_status.py`: In-memory price refresh job progress (`GET /api/admin/refresh-status`).
+- `backend/services/backtest_status.py`: In-memory bulk backtest job progress (`GET /api/admin/backtest-status`).
+- `backend/services/backtest_storage.py`: Persist/load/compare saved backtest runs in SQLite.
 
 #### `backend/utils/`
 - `backend/utils/__init__.py`: Utils package marker.
 - `backend/utils/nasdaq100_tickers.py`: Tracked universe list and “active tickers” selection (LIGHT_MODE-aware).
 - `backend/utils/ticker_validate.py`: Validates a ticker is in the tracked universe (404 otherwise).
-- `backend/utils/ml_paths.py`: Makes filesystem-safe artifact stems (e.g., `^NDX` → `_NDX`).
+- `backend/utils/ml_paths.py`: Per-ticker model directory names (`artifact_stem`, e.g. `^NDX` → `NDX`) and one-time `migrate_flat_to_subfolders`.
 
 ### `frontend/` — React + Vite UI
 
@@ -52,16 +56,19 @@ Scope note:
 - `frontend/src/api/client.ts`: Axios client and typed wrappers for API endpoints.
 
 #### `frontend/src/pages/`
-- `frontend/src/pages/Dashboard.tsx`: Stock list + refresh/train actions + training progress.
+- `frontend/src/pages/Dashboard.tsx`: Stock list + refresh/train actions + refresh + training progress bars.
 - `frontend/src/pages/StockDetail.tsx`: History/indicators charts and ensemble forecast cards for one ticker.
-- `frontend/src/pages/Backtesting.tsx`: Scenario runner, holdout selector, and scenario-5 bulk backtest table.
+- `frontend/src/pages/Backtesting.tsx`: Scenario runner, holdout selector, bulk backtest (poll + progress), links to saved runs.
+- `frontend/src/pages/BacktestHistory.tsx`, `BacktestCompare.tsx`, `BacktestRunDetail.tsx`, `BacktestTickerDetail.tsx`: Saved-run UX.
 
 #### `frontend/src/components/`
 - `frontend/src/components/Navbar.tsx`: Simple navigation links.
 - `frontend/src/components/StockChart.tsx`: Close-price line chart (Recharts).
 - `frontend/src/components/IndicatorChart.tsx`: RSI/Bollinger and MACD charts (Recharts).
 - `frontend/src/components/PredictionCard.tsx`: Horizon card showing ensemble price and CI.
-- `frontend/src/components/TrainingProgress.tsx`: Training status progress bar (polls API via page).
+- `frontend/src/components/TrainingProgress.tsx`: Training status progress bar (Dashboard).
+- `frontend/src/components/RefreshProgress.tsx`: Price refresh progress bar (Dashboard).
+- `frontend/src/components/BacktestProgress.tsx`: Bulk backtest progress bar (Backtesting page).
 
 ---
 
@@ -74,8 +81,11 @@ This module defines the LSTM feature pipeline, training loop, artifact format, a
 #### Public / frequently used functions
 
 - `lstm_feature_columns() -> list[str]`
-  - **Returns** the exact ordered feature names used as LSTM input.
+  - **Returns** the exact ordered feature names used as LSTM input (**7** base columns, plus **5** macro names when `USE_MACRO_FEATURES` is true → **12** total).
   - **Used by** metadata saving and feature extraction.
+
+- `log_lstm_feature_summary() -> None`
+  - Logs `LSTM input features (N): [...]` once at app startup (`main.py` lifespan).
 
 - `min_ohlcv_rows_for_lstm_window(seq_len: int) -> int`
   - **Returns** minimum required rows to build one LSTM input window.
@@ -86,17 +96,17 @@ This module defines the LSTM feature pipeline, training loop, artifact format, a
   - **Does**:
     - loads OHLCV from SQLite (`get_ohlcv_dataframe`)
     - adds indicators (`add_indicators`)
+    - optionally merges macro features (`get_macro_dataframe` + `merge_macro_features`) when `USE_MACRO_FEATURES` is enabled
     - builds (X, y) windows where y is cumulative simple returns for horizons (1,7,30,90)
     - splits windows into train/validation
     - fits `MinMaxScaler` on training windows only
     - trains 2-layer LSTM model and saves:
-      - `*_lstm.keras` (Keras model)
-      - `*_lstm_meta.joblib` (scaler + feature columns + seq len + meta version)
+      - `lstm.keras` and `lstm_meta.joblib` under `MODEL_DIR/<ticker_dir>/` (Keras model + scaler / meta)
   - **Output**: a small status dict including sample count.
 
 - `load_trained_lstm_bundle(ticker, model_root=None)`
   - **Loads** the Keras model and joblib meta. Calls `_load_keras_and_meta`.
-  - **Guards** against incompatible artifacts with `meta_version` and missing `fx`.
+  - **Guards** against incompatible artifacts with `meta_version` (current code expects **≥ 4** for macro-capable checkpoints) and missing `fx`.
 
 - `predict_lstm_horizons(session, ticker, model_root=None) -> dict[str, float]`
   - **Returns** price forecasts for `'7'`, `'30'`, `'90'` (not `'1'`) for live API usage.
@@ -121,6 +131,7 @@ This module defines the LSTM feature pipeline, training loop, artifact format, a
 - `_lstm_raw_features(feat: pd.DataFrame) -> pd.DataFrame`
   - Builds scale-free per-row features:
     - `ret_close`, `ret_volume`, `rsi_14/100`, and relative MACD/Bollinger distances.
+    - When macros are enabled, appends the five macro columns from `feat` (already rolling-scaled in `merge_macro_features`).
 
 - `_lstm_feature_matrix(feat: pd.DataFrame) -> pd.DataFrame`
   - Applies forward-fill and selects the final ordered feature columns.
@@ -141,13 +152,14 @@ This module runs walk-forward evaluations (“backtests”) on a holdout segment
 
 - `run_backtest(session, ticker, scenario=1, years=None, max_holdout=False, light=False) -> dict`
   - Central entry point for scenarios 1–5.
+  - Loads optional **`macro_df`** via `get_macro_dataframe` when `USE_MACRO_FEATURES` is true and threads it into scenario helpers (`_build_feat_full`, `_indicator_frame_for_rollout`, rollouts) so macro data is **never taken from dates after** the current equity bar.
   - Slices holdout via `_holdout_slice`.
   - Precomputes ARIMA one-step series via `arima_walk_one_step`.
   - Trains a temporary LSTM inside each scenario (Scenario 5 trains once and reuses).
 
-- `run_backtest_all(session, scenario=5, years=None, max_holdout=False) -> dict`
+- `run_backtest_all(session, scenario=5, years=None, max_holdout=False, persist=True) -> dict`
   - Sequentially runs Scenario 5 across active tickers (LIGHT_MODE-aware).
-  - Records per-ticker `status` and aggregate summaries.
+  - Records per-ticker `status` and aggregate summaries; may persist full payloads via `backtest_storage` (`saved_run_id` in response when successful).
 
 #### Holdout selection
 
@@ -180,9 +192,9 @@ This module runs walk-forward evaluations (“backtests”) on a holdout segment
 
 #### Honest rollout mechanics (Scenario 2/3/5)
 
-- `_lstm_rollout_closes_at_steps(model, meta, df_upto_anchor, milestones)`
+- `_lstm_rollout_closes_at_steps(model, meta, df_upto_anchor, milestones, macro_df=None)`
   - Appends synthetic rows one business day at a time using `_append_synthetic_close_row`.
-  - Recomputes indicators on the synthetic frame via `_indicator_frame_for_rollout`.
+  - Recomputes indicators on the synthetic frame via `_indicator_frame_for_rollout` (passes **`macro_df`** so macro columns forward-fill only from known history up to the rollout’s last date).
   - Predicts next-day close with `predict_lstm_one_step_with_model`.
 
 #### ARIMA helper used for multi-step backtests
@@ -227,8 +239,14 @@ This module computes the indicators used for charts and as ML inputs:
   - Early rows are NaN until rolling windows warm up.
   - Volume is forward/back-filled inside this function.
 
+- `macro_feature_columns() -> list[str]`
+  - Names of macro inputs (empty when `USE_MACRO_FEATURES` is false).
+
+- `merge_macro_features(feat_df, macro_df) -> pd.DataFrame`
+  - Left-aligns macro to equity dates, drops macro rows after the last equity date, reindex+ffill, applies **rolling** min–max over `LSTM_ROLLING_NORM_WINDOW` per macro column, clips to [0,1].
+
 - `feature_columns() -> list[str]`
-  - Legacy list used for chart payloads (LSTM uses `lstm_feature_columns`).
+  - Chart/legacy column list: OHLCV-related indicators plus macro names when enabled.
 
 ---
 
@@ -261,9 +279,16 @@ This module owns the Yahoo Finance download flow and SQLite persistence.
 
 #### Scheduler/admin runner
 
+- `fetch_macro_features(session) -> dict`
+  - Downloads `settings.MACRO_TICKERS`, aligns columns to `MACRO_FEATURE_COLUMNS`, forward-fills, replaces **`macro_daily`** rows. Skipped when `USE_MACRO_FEATURES` is false.
+
+- `get_macro_dataframe(session) -> pd.DataFrame`
+  - Reads `macro_daily` into a time-indexed frame (forward-filled).
+
 - `run_refresh_for_active_tickers() -> dict`
   - Opens a short-lived DB session and refreshes every active ticker.
   - Updates app meta `last_price_refresh_utc` when any refresh succeeds.
+  - Calls **`fetch_macro_features`** after equities when `USE_MACRO_FEATURES` is true (macro failures are logged; equity refresh still stands).
 
 ---
 
@@ -271,7 +296,7 @@ This module owns the Yahoo Finance download flow and SQLite persistence.
 
 Step-by-step flow for **live predictions** (not backtests):
 
-1. Download → 2. Cache → 3. Load DF → 4. Indicators → 5. Feature scaling →
+1. Download → 2. Cache → 3. Load DF → 4. Indicators → 4b. Macro merge (if enabled) → 5. Feature scaling →
 6. LSTM predict → 7. ARIMA refit+predict → 8. Ensemble blend → 9. API JSON
 
 ASCII diagram:
@@ -281,19 +306,22 @@ Yahoo Finance (yfinance)
    |
    |  POST /api/admin/refresh
    v
-SQLite (PriceBar rows)  <-------------------+
-   |                                       |
-   |  get_ohlcv_dataframe()                |  scheduled_refresh_job()
-   v                                       |
-pandas DataFrame (open/high/low/close/vol) |
-   |                                       |
-   |  add_indicators()                     |
-   v                                       |
-indicator-enriched DataFrame               |
-   |                                       |
-   |  LSTM: build last 60-row window       |
-   |  + MinMaxScaler from meta (fx)        |
-   v                                       |
+SQLite (PriceBar + optional macro_daily)  <-------------+
+   |                                                    |
+   |  get_ohlcv_dataframe()                             |  scheduled_refresh_job()
+   v                                                    |
+pandas DataFrame (OHLCV)                               |
+   |                                                    |
+   |  add_indicators()                                  |
+   v                                                    |
+indicator-enriched DataFrame                           |
+   |                                                    |
+   |  merge_macro_features() if USE_MACRO_FEATURES      |
+   v                                                    |
+feature frame for LSTM                                 |
+   |                                                    |
+   |  last 60-row window + MinMaxScaler (meta fx)       |
+   v                                                    |
 LSTM returns (+7/+30/+90)  ---> price heads (anchor_close*(1+r))
    |
    |  ARIMA: auto_arima(refit on log close)
@@ -389,7 +417,7 @@ Base URL (backend): `http://127.0.0.1:8000`
 - **GET** `/api/stocks/{ticker}/prediction`
   - **Does**: returns ensemble forecasts for 7/30/90 days plus CIs.
   - **Notes**:
-    - requires an LSTM checkpoint for the ticker (`*_lstm.keras` + `*_lstm_meta.joblib`)
+    - requires an LSTM checkpoint under `MODEL_DIR/<ticker_dir>/` (`lstm.keras` + `lstm_meta.joblib`)
     - ARIMA is refit from SQLite on every request
   - **Response** (from `services/ensemble.py`):
 
@@ -430,15 +458,33 @@ Base URL (backend): `http://127.0.0.1:8000`
       - `metrics` (scenario-specific object)
       - `series` (chart data; scenario 5 also includes `price_accuracy` and `direction_accuracy`)
 
+### 4.6b Saved backtest runs (SQLite)
+
+- **GET** `/api/backtest-runs` — list runs (metadata + ticker counts).
+- **GET** `/api/backtest-runs/{id}` — one run aggregate + per-ticker summary rows.
+- **GET** `/api/backtest-runs/{id}/ticker/{ticker}` — full saved JSON payload for one symbol.
+- **GET** `/api/backtest-runs/compare/summary?a={id}&b={id}` — side-by-side comparison.
+- **DELETE** `/api/backtest-runs/{id}` — remove a run and its ticker rows.
+
 ### 4.7 Admin: refresh prices
 
 - **POST** `/api/admin/refresh`
-  - **Does**: runs refresh for active tickers in a background task (returns immediately).
-  - **Response**:
+  - **Does**: runs refresh for active tickers in a background task (returns immediately). Also refreshes **`macro_daily`** when `USE_MACRO_FEATURES` is true.
+  - **Errors**: **409** if a refresh job is already running.
+  - **Response** (shape):
 
 ```json
-{ "status": "accepted", "detail": "Refreshing 5 ticker(s) in the background. Poll GET /api/stocks for new prices." }
+{
+  "status": "accepted",
+  "detail": "Refreshing 5 ticker(s) in the background. Poll GET /api/admin/refresh-status for progress.",
+  "tickers": ["AAPL", "MSFT"]
+}
 ```
+
+### 4.7b Admin: refresh status
+
+- **GET** `/api/admin/refresh-status`
+  - **Does**: snapshot for polling (`state`, `percent`, `current_ticker`, `completed_tickers` / `total_tickers`, `message`, `finished_at`, `error_detail`, optional `result` summary).
 
 ### 4.8 Admin: train models
 
@@ -471,11 +517,18 @@ Base URL (backend): `http://127.0.0.1:8000`
 }
 ```
 
-### 4.10 Admin: bulk backtest
+### 4.9b Admin: bulk backtest status
 
-- **POST** `/api/admin/backtest-all?scenario=5&years=5`
-  - **Does**: runs scenario 5 sequentially for each active ticker; continues on failures.
-  - **Response** (from `services/backtester.py::run_backtest_all`):
+- **GET** `/api/admin/backtest-status`
+  - **Does**: snapshot while a bulk job runs or after completion (`state`, `percent`, `current_ticker`, `result` when `completed`, `error_detail` when `error`).
+
+### 4.10 Admin: bulk backtest (queued)
+
+- **POST** `/api/admin/backtest-all?scenario=5&years=5&persist=true`
+  - **Does**: **queues** scenario 5 in a background task (returns immediately). The worker runs `run_backtest_all` sequentially per active ticker; continues on failures. Poll **`GET /api/admin/backtest-status`** for progress and the final payload in `result`.
+  - **Errors**: **409** if a bulk backtest is already running. Only **scenario=5** is supported.
+  - **Response** (immediate accept shape): `{ "status": "accepted", "detail": "...", "tickers": [...] }`
+  - **Final metrics** (inside `result` when poll shows `completed`) — same aggregate shape as the synchronous runner used to return:
 
 ```json
 {
@@ -513,10 +566,16 @@ All settings are defined on `config.Settings` and may be overridden by environme
 
 - `LIGHT_MODE: bool = True`
   - Controls active tickers: small subset vs full universe.
+- `USE_MACRO_FEATURES: bool = True`
+  - When true, refresh fills `macro_daily` and LSTM uses 12 input features; when false, macro fetch is skipped and LSTM uses 7 features.
+- `MACRO_TICKERS: list[str]`
+  - Yahoo symbols aligned with module constant `MACRO_FEATURE_COLUMNS` in `config.py` (same length enforced by validator).
+- `MACRO_FEATURE_COLUMNS` (module constant in `config.py`)
+  - DB/LSTM macro column names: `vix`, `treasury_10y`, `dollar_index`, `oil_wti`, `sp500_close`.
 - `DATABASE_URL: str = "sqlite:///.../nasdaq_predictor.db"`
   - SQLite path for cached prices.
 - `HISTORY_YEARS: int = 12`
-  - How much history is requested from Yahoo during refresh.
+  - How much history is requested from Yahoo during refresh (equities and macro downloads).
 - `CORS_ORIGINS: str = "http://localhost:5173,http://127.0.0.1:5173"`
   - Browser origins allowed to call the API.
 - `PRICE_REFRESH_INTERVAL_HOURS: int = 24`
@@ -534,9 +593,8 @@ All settings are defined on `config.Settings` and may be overridden by environme
 - `LSTM_LEARNING_RATE: float = 0.0005`
 - `SEQUENCE_LENGTH: int = 60`
 
-Legacy/compat:
 - `LSTM_ROLLING_NORM_WINDOW: int = 252`
-  - Deprecated in current pipeline (inputs use MinMaxScaler fit on training split).
+  - Rolling window for **macro** column scaling in `merge_macro_features` (min–max over trailing window, causal along the date index).
 
 ### Backtest settings
 

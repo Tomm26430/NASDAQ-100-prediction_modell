@@ -16,8 +16,8 @@ import yfinance as yf
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
-from config import settings
-from models.database import AppMeta, PriceBar, get_session_factory
+from config import MACRO_FEATURE_COLUMNS, settings
+from models.database import AppMeta, MacroDaily, PriceBar, get_session_factory
 from utils.nasdaq100_tickers import get_active_tickers
 
 logger = logging.getLogger(__name__)
@@ -46,6 +46,27 @@ def _refresh_progress_done_one() -> None:
 def _yahoo_ticker(symbol: str) -> str:
     """Normalize symbols for yfinance (already correct for US equities and ^NDX)."""
     return symbol.strip()
+
+
+def _macro_close_history(yf_symbol: str) -> pd.Series:
+    """
+    Download daily Close for one Yahoo macro / index symbol (same window as stock HISTORY_YEARS).
+
+    Returns an empty float series on failure so other symbols can still populate macro_daily.
+    """
+    sym = _yahoo_ticker(yf_symbol)
+    try:
+        t = yf.Ticker(sym)
+        df = t.history(period=f"{settings.HISTORY_YEARS}y", interval="1d", auto_adjust=True, repair=False)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Macro history request failed for %s: %s", sym, exc)
+        return pd.Series(dtype=float)
+    if df is None or df.empty:
+        logger.warning("No macro history returned for %s", sym)
+        return pd.Series(dtype=float)
+    s = df["Close"].astype(float)
+    s.index = pd.to_datetime(s.index).normalize()
+    return s
 
 
 def download_daily_history(symbol: str) -> pd.DataFrame:
@@ -196,6 +217,70 @@ def touch_last_refresh_time(session: Session) -> None:
     set_meta(session, "last_price_refresh_utc", now)
 
 
+def fetch_macro_features(session: Session) -> dict[str, Any]:
+    """
+    Download all configured MACRO_TICKERS, align on dates, forward-fill gaps, replace macro_daily.
+
+    No-op when USE_MACRO_FEATURES is False (returns a small status dict).
+    """
+    if not settings.USE_MACRO_FEATURES:
+        return {"skipped": True, "reason": "USE_MACRO_FEATURES is False"}
+
+    cols = MACRO_FEATURE_COLUMNS
+    series_list: list[pd.Series] = []
+    for yf_sym, col in zip(settings.MACRO_TICKERS, cols, strict=True):
+        s = _macro_close_history(yf_sym)
+        s.name = col
+        series_list.append(s)
+
+    combined = pd.concat(series_list, axis=1).sort_index()
+    combined = combined.ffill()
+
+    session.execute(delete(MacroDaily))
+    session.commit()
+
+    n_inserted = 0
+    for ts, row in combined.iterrows():
+        trade_date = pd.Timestamp(ts).date()
+        kwargs = {c: (float(row[c]) if c in row.index and pd.notna(row[c]) else None) for c in cols}
+        session.add(MacroDaily(trade_date=trade_date, **kwargs))
+        n_inserted += 1
+    session.commit()
+
+    return {
+        "macro_rows": n_inserted,
+        "macro_start": str(combined.index.min()) if n_inserted else None,
+        "macro_end": str(combined.index.max()) if n_inserted else None,
+    }
+
+
+def get_macro_dataframe(session: Session) -> pd.DataFrame:
+    """
+    Load macro_daily as a pandas DataFrame indexed by normalized date.
+
+    Forward-fills missing values along the time index. Returns empty DataFrame if macro is disabled
+    or the table has no rows.
+    """
+    if not settings.USE_MACRO_FEATURES:
+        return pd.DataFrame()
+    stmt = select(MacroDaily).order_by(MacroDaily.trade_date)
+    rows = list(session.execute(stmt).scalars().all())
+    if not rows:
+        return pd.DataFrame()
+    cols = MACRO_FEATURE_COLUMNS
+    data: dict[str, list] = {
+        "date": [r.trade_date for r in rows],
+    }
+    for c in cols:
+        data[c] = [getattr(r, c) for r in rows]
+    df = pd.DataFrame(data)
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.set_index("date").sort_index()
+    df[cols] = df[cols].astype(float)
+    df[cols] = df[cols].ffill()
+    return df
+
+
 def run_refresh_for_active_tickers() -> dict[str, Any]:
     """
     Open a short-lived session and refresh every ticker returned by get_active_tickers().
@@ -210,7 +295,16 @@ def run_refresh_for_active_tickers() -> dict[str, Any]:
         if any(str(v).startswith("ok") for v in results.values()):
             touch_last_refresh_time(db)
         failures = {k: v for k, v in results.items() if not str(v).startswith("ok")}
-        return {"tickers_requested": len(tickers), "results": results, "failures": failures}
+        out: dict[str, Any] = {"tickers_requested": len(tickers), "results": results, "failures": failures}
+        if settings.USE_MACRO_FEATURES:
+            try:
+                msum = fetch_macro_features(db)
+                out["macro"] = msum
+                logger.info("Macro daily refresh: %s", msum)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Macro feature fetch failed (price refresh still committed): %s", exc)
+                out["macro"] = {"error": str(exc)}
+        return out
     except Exception as exc:  # noqa: BLE001
         logger.exception("Scheduled/manual refresh crashed")
         db.rollback()

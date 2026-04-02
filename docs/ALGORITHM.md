@@ -7,6 +7,7 @@ Relevant code:
 - `backend/services/lstm_model.py`
 - `backend/services/arima_model.py`
 - `backend/services/indicators.py`
+- `backend/services/data_fetcher.py` (macro cache)
 - `backend/config.py`
 
 ---
@@ -37,13 +38,15 @@ In code, the ensemble happens in `backend/services/ensemble.py` via a simple wei
 
 The LSTM uses a rolling window of length `SEQUENCE_LENGTH` (default **60**) from `backend/config.py`.
 
-Each training example is a **60-day sequence** of engineered features computed from OHLCV + indicators.
+Each training example is a **60-day sequence** of engineered features computed from OHLCV + indicators, and **optionally** five **macro** series (when `USE_MACRO_FEATURES` is true in `config.py`).
 
 ### 2.2 Features used (and why)
 
 The LSTM does **not** ingest raw “Close” and “Volume” directly. Instead it uses **scale-free**, return-based features so the network does not need to learn absolute price levels.
 
-The exact feature columns fed to the LSTM are defined in `lstm_model.lstm_feature_columns()`:
+The exact feature columns fed to the LSTM are defined in `lstm_model.lstm_feature_columns()` (logged at server startup as `LSTM input features (N): [...]`).
+
+**Base columns (always present):**
 
 - **`ret_close`**: daily percentage change of close (close-to-close return).
   - Why: captures short-term momentum/reversal without encoding the absolute price level.
@@ -56,6 +59,10 @@ The exact feature columns fed to the LSTM are defined in `lstm_model.lstm_featur
 - **`bb_upper_rel`** and **`bb_lower_rel`**: (upper band − close)/close and (lower band − close)/close.
   - Why: expresses “distance to the band” as a percentage, which is more stable than raw price distances.
 
+**Macro columns (optional, when `USE_MACRO_FEATURES` is true):**
+
+Aligned to the equity calendar from SQLite table **`macro_daily`**, built from Yahoo symbols in `MACRO_TICKERS` (defaults: `^VIX`, `^TNX`, `DX-Y.NYB`, `CL=F`, `^GSPC`). Stored columns: **`vix`**, **`treasury_10y`**, **`dollar_index`**, **`oil_wti`**, **`sp500_close`**. After a left join on date, missing days are forward-filled; each series is scaled with a **causal rolling min–max** over `LSTM_ROLLING_NORM_WINDOW` (default **252** trading days) in `merge_macro_features`, then clipped to **[0, 1]**. Those values are appended to the raw feature matrix before the **global** `MinMaxScaler` is fit on training windows.
+
 Indicators are computed by `backend/services/indicators.py`:
 - RSI(14)
 - MACD(12, 26, 9)
@@ -65,7 +72,7 @@ Indicators are computed by `backend/services/indicators.py`:
 
 The architecture is defined in `train_lstm_for_ticker()` in `backend/services/lstm_model.py`:
 
-- Input shape: `(60, n_features)` where `n_features = 7`
+- Input shape: `(60, n_features)` where `n_features = 7` without macros and **`12`** when macro features are enabled (`7 + 5`).
 - Layer 1: `LSTM(LSTM_UNITS=100, return_sequences=True)`
 - Dropout: `Dropout(LSTM_DROPOUT=0.25)`
 - Layer 2: `LSTM(LSTM_UNITS=100)`
@@ -121,8 +128,8 @@ Implementation details:
 - Inference scaling happens in `_scaled_window_tensor()` using `fx.transform(...)`.
 
 **Note on “rolling normalization”**
-- The current pipeline uses MinMax scaling (train-split only) rather than a per-window rolling z-score.
-- The setting `LSTM_ROLLING_NORM_WINDOW` remains in `config.py` for environment compatibility but is not used by the current LSTM feature pipeline.
+- The **main** LSTM inputs are scaled with `MinMaxScaler` fit on the **training window split** only.
+- **`LSTM_ROLLING_NORM_WINDOW`** is used specifically to normalize **macro** columns before they enter that matrix (rolling min–max along time, causal).
 
 ### 2.6 Training process (epochs, early stopping, validation split)
 
@@ -130,10 +137,11 @@ Training steps in `train_lstm_for_ticker()`:
 
 1. Load OHLCV from SQLite: `services.data_fetcher.get_ohlcv_dataframe()`
 2. Add indicators: `services.indicators.add_indicators(df).ffill().fillna(0.0)`
-3. Build windows and targets: `_build_xy(...)`
-4. Split into train/validation (default 85% / 15%, with fallback to 80/20 if too small)
-5. Fit scaler on training only; transform both splits
-6. Train using:
+3. If enabled: merge macro features from `get_macro_dataframe()` via `merge_macro_features(...)` (training slices macro to dates ≤ last training bar)
+4. Build windows and targets: `_build_xy(...)`
+5. Split into train/validation (default 85% / 15%, with fallback to 80/20 if too small)
+6. Fit scaler on training only; transform both splits
+7. Train using:
    - Optimizer: Adam with `LSTM_LEARNING_RATE` (default **0.0005**)
    - Loss: Mean Squared Error (`"mse"`)
    - Early stopping:
@@ -345,13 +353,17 @@ In this project, the LSTM uses distance-to-band features (`bb_upper_rel`, `bb_lo
 
 ### 6.1 News-driven moves are not predictable from price history alone
 
-This system uses OHLCV and technical indicators derived from price/volume. It does not ingest:
+This system uses OHLCV and technical indicators derived from price/volume, and—when enabled—a **small set of daily macro/index levels** (VIX, yields, dollar, oil, S&P) that are public market summaries, not structured news. It does not ingest:
 - news text,
 - earnings calendars,
-- macro announcements,
+- detailed macro calendars,
 - or order-book data.
 
-So sudden event-driven moves will look like “unexplained shocks.”
+So sudden event-driven moves will still look like “unexplained shocks” relative to what the model sees.
+
+### 6.1b Checkpoint compatibility and toggling macros
+
+Saved LSTM artifacts record `meta_version` and `feature_cols`. Changing **`USE_MACRO_FEATURES`** or upgrading the pipeline typically **invalidates** old checkpoints (e.g. input width 7 vs 12). Delete incompatible files under `saved_models/` and retrain.
 
 ### 6.2 Multi-step rollout error compounds over longer horizons
 

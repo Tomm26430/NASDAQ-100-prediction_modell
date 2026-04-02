@@ -21,8 +21,9 @@ from config import settings
 from models.database import get_db, get_session_factory, init_db
 from routers import admin, backtest_runs, stocks
 from services.ensemble import ensemble_forecast
-from services.lstm_model import lstm_model_exists
-from services.data_fetcher import get_latest_bar, run_refresh_for_active_tickers
+from services.lstm_model import lstm_model_exists, log_lstm_feature_summary
+from services.data_fetcher import fetch_macro_features, get_latest_bar, run_refresh_for_active_tickers
+from utils.ml_paths import migrate_flat_to_subfolders
 from utils.nasdaq100_tickers import get_active_tickers
 
 logging.basicConfig(level=logging.INFO)
@@ -57,6 +58,15 @@ def _startup_backfill() -> None:
         db.close()
     if warm:
         logger.info("Startup backfill skipped; cache already has active tickers.")
+        if settings.USE_MACRO_FEATURES:
+            db2 = SessionLocal()
+            try:
+                fetch_macro_features(db2)
+                logger.info("Startup macro series refresh finished (cache was already warm).")
+            except Exception:
+                logger.exception("Startup macro refresh failed")
+            finally:
+                db2.close()
         return
     logger.info("Startup backfill starting for %s", tickers)
     summary = run_refresh_for_active_tickers()
@@ -67,6 +77,9 @@ def _startup_backfill() -> None:
 async def lifespan(app: FastAPI):
     # Create SQLite file + tables before accepting traffic
     init_db()
+    # Move legacy flat saved_models/*_lstm.keras into per-ticker folders before any training/predict paths.
+    migrate_flat_to_subfolders()
+    log_lstm_feature_summary()
     # Warm cache without blocking the event loop
     loop = asyncio.get_running_loop()
     loop.run_in_executor(None, _startup_backfill)

@@ -17,8 +17,8 @@ from sqlalchemy.orm import Session
 
 from config import settings
 from services.arima_model import arima_walk_one_step
-from services.data_fetcher import get_ohlcv_dataframe
-from services.indicators import add_indicators
+from services.data_fetcher import get_macro_dataframe, get_ohlcv_dataframe
+from services.indicators import add_indicators, merge_macro_features
 from services.lstm_model import (
     load_trained_lstm_bundle,
     min_ohlcv_rows_for_lstm_window,
@@ -171,9 +171,23 @@ def _holdout_note(
     return None
 
 
-def _indicator_frame_for_rollout(ohlcv: pd.DataFrame) -> pd.DataFrame:
-    """Indicators on a growing OHLCV frame; forward-fill only (no bfill) before LSTM MinMax-scaled features."""
+def _build_feat_full(df: pd.DataFrame, macro_df: pd.DataFrame | None) -> pd.DataFrame:
+    """Full-history indicator frame with optional macro merge (walk-forward safe: rolling uses row order only)."""
+    feat = add_indicators(df).ffill().fillna(0.0)
+    if settings.USE_MACRO_FEATURES and macro_df is not None and not macro_df.empty:
+        feat = merge_macro_features(feat, macro_df)
+    return feat.fillna(0.0)
+
+
+def _indicator_frame_for_rollout(ohlcv: pd.DataFrame, macro_df: pd.DataFrame | None = None) -> pd.DataFrame:
+    """
+    Indicators on a growing OHLCV frame; macro rows are limited to dates <= last bar in ohlcv (no lookahead).
+    """
     feat = add_indicators(ohlcv).ffill()
+    if settings.USE_MACRO_FEATURES and macro_df is not None and not macro_df.empty:
+        end = ohlcv.index.max()
+        m = macro_df.loc[macro_df.index <= end]
+        feat = merge_macro_features(feat, m)
     return feat.fillna(0.0)
 
 
@@ -199,12 +213,13 @@ def _lstm_rollout_close(
     meta: dict,
     df_upto_anchor: pd.DataFrame,
     steps: int,
+    macro_df: pd.DataFrame | None = None,
 ) -> float:
     """
     Multi-step honest path: each new bar uses the LSTM's previous predicted close as input,
     not realized prices, for `steps` forward trading days from the last row of df_upto_anchor.
     """
-    out = _lstm_rollout_closes_at_steps(model, meta, df_upto_anchor, (steps,))
+    out = _lstm_rollout_closes_at_steps(model, meta, df_upto_anchor, (steps,), macro_df)
     return float(out.get(steps, float("nan")))
 
 
@@ -213,6 +228,7 @@ def _lstm_rollout_closes_at_steps(
     meta: dict,
     df_upto_anchor: pd.DataFrame,
     milestones: tuple[int, ...],
+    macro_df: pd.DataFrame | None = None,
 ) -> dict[int, float]:
     """
     One chained rollout through max(milestones) days; records synthetic close after each milestone step.
@@ -225,7 +241,7 @@ def _lstm_rollout_closes_at_steps(
     work = df_upto_anchor.copy()
     recorded: dict[int, float] = {}
     for step in range(1, max_h + 1):
-        feat = _indicator_frame_for_rollout(work)
+        feat = _indicator_frame_for_rollout(work, macro_df)
         pred = predict_lstm_one_step_with_model(model, meta, feat)
         if not np.isfinite(pred):
             return {h: float("nan") for h in milestones}
@@ -328,6 +344,7 @@ def _scenario_2_price_metrics_and_series(
     wa: float,
     arima_one_m: dict,
     stress_dates: set[str] | None,
+    macro_df: pd.DataFrame | None = None,
 ) -> tuple[dict, list[dict], str | None]:
     """
     Scenario 2/3 price path using an already-trained LSTM (honest multi-step rollout).
@@ -350,7 +367,7 @@ def _scenario_2_price_metrics_and_series(
             prefix = df.iloc[: anchor + 1]
             train_c = close_all[: anchor + 1]
             need_roll = tuple(sorted(set(horizons) | {chart_h}))
-            lstm_by_h = _lstm_rollout_closes_at_steps(model, meta, prefix, need_roll)
+            lstm_by_h = _lstm_rollout_closes_at_steps(model, meta, prefix, need_roll, macro_df)
             for h in horizons:
                 lstm_p = float(lstm_by_h.get(h, float("nan")))
                 arima_p = _arima_price_h_ahead(train_c, h)
@@ -413,6 +430,7 @@ def _scenario_4_direction_samples_only(
     test_start: int,
     wl: float,
     wa: float,
+    macro_df: pd.DataFrame | None = None,
 ) -> tuple[dict, str | None]:
     """
     Same directional samples as Scenario 4 (strided anchors, ensemble multi-horizon vs ref close),
@@ -427,7 +445,7 @@ def _scenario_4_direction_samples_only(
 
     try:
         seq_need = _lstm_min_input_rows(int(meta["seq_len"]))
-        feat_full = add_indicators(df).ffill().fillna(0.0)
+        feat_full = _build_feat_full(df, macro_df)
         for i in range(test_start, n - 30):
             if (i - test_start) % dir_stride != 0:
                 continue
@@ -565,7 +583,17 @@ def run_backtest(
     ]
     arima_one_m = _metrics(arima_actual, arima_pred)
 
-    ykw = {"holdout_years_requested": years_req, "holdout_years_actual": years_act}
+    macro_df: pd.DataFrame | None = None
+    if settings.USE_MACRO_FEATURES:
+        macro_df = get_macro_dataframe(session)
+        if macro_df is not None and macro_df.empty:
+            macro_df = None
+
+    ykw = {
+        "holdout_years_requested": years_req,
+        "holdout_years_actual": years_act,
+        "macro_df": macro_df,
+    }
 
     if scenario == 1:
         return _scenario_1_daily(
@@ -666,6 +694,7 @@ def _scenario_1_daily(
     wl: float,
     wa: float,
     *,
+    macro_df: pd.DataFrame | None = None,
     holdout_years_requested: float | None,
     holdout_years_actual: float,
 ) -> dict:
@@ -685,7 +714,7 @@ def _scenario_1_daily(
             )
             model, meta = load_trained_lstm_bundle(ticker, model_root=root)
             seq_need = _lstm_min_input_rows(int(meta["seq_len"]))
-            feat_full = add_indicators(df).ffill().fillna(0.0)
+            feat_full = _build_feat_full(df, macro_df)
             for i in range(test_start, n - 1):
                 dt = df.index[i]
                 if dt not in feat_full.index:
@@ -757,6 +786,7 @@ def _scenario_2_multistep(
     wa: float,
     *,
     stress_dates: set[str] | None,
+    macro_df: pd.DataFrame | None = None,
     holdout_years_requested: float | None,
     holdout_years_actual: float,
 ) -> dict:
@@ -788,6 +818,7 @@ def _scenario_2_multistep(
                 wa,
                 arima_one_m,
                 stress_dates,
+                macro_df,
             )
             if lstm_err:
                 metrics["lstm"] = {**metrics.get("lstm", {}), "error": lstm_err}
@@ -831,6 +862,7 @@ def _scenario_5_combined(
     wa: float,
     *,
     light: bool = False,
+    macro_df: pd.DataFrame | None = None,
     holdout_years_requested: float | None,
     holdout_years_actual: float,
 ) -> dict:
@@ -870,13 +902,21 @@ def _scenario_5_combined(
                 wl,
                 wa,
                 arima_one_m,
-                stress_dates=None,
+                None,  # stress_dates (None = use all trading days, unlike Scenario 3)
+                macro_df,
             )
             if perr:
                 combined_err.append(perr)
             # Same model: directional stats aligned with Scenario 4 sampling rules.
             direction_block, derr = _scenario_4_direction_samples_only(
-                model, meta, df, n, test_start, wl, wa
+                model,
+                meta,
+                df,
+                n,
+                test_start,
+                wl,
+                wa,
+                macro_df=macro_df,
             )
             if derr:
                 combined_err.append(derr)
@@ -934,6 +974,7 @@ def _scenario_4_direction(
     wl: float,
     wa: float,
     *,
+    macro_df: pd.DataFrame | None = None,
     holdout_years_requested: float | None,
     holdout_years_actual: float,
 ) -> dict:
@@ -957,7 +998,7 @@ def _scenario_4_direction(
             )
             model, meta = load_trained_lstm_bundle(ticker, model_root=root)
             seq_need = _lstm_min_input_rows(int(meta["seq_len"]))
-            feat_full = add_indicators(df).ffill().fillna(0.0)
+            feat_full = _build_feat_full(df, macro_df)
             # Sparse ARIMA refits for direction stats (full daily LSTM series still above).
             dir_stride = max(1, int(settings.BACKTEST_SCENARIO4_DIRECTION_STRIDE))
             for i in range(test_start, n - 1):

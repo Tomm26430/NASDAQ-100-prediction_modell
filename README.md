@@ -37,12 +37,13 @@ Complete instructions from first install through daily use, API usage, and troub
 The **NASDAQ Predictor** is a local full-stack tool that:
 
 1. **Downloads and caches** daily OHLCV (open, high, low, close, volume) for Nasdaq-100 constituents and the **Nasdaq-100 index** (`^NDX`) via Yahoo Finance (`yfinance`).
-2. **Computes technical indicators**: RSI(14), MACD(12/26/9), Bollinger Bands (20, 2σ).
-3. **Trains per-symbol models**:
+2. **Optionally caches macro series** (VIX, 10Y yield, US dollar index, WTI crude, S&P 500) in SQLite table **`macro_daily`** when `USE_MACRO_FEATURES` is enabled—used as extra **LSTM** inputs (not by ARIMA).
+3. **Computes technical indicators**: RSI(14), MACD(12/26/9), Bollinger Bands (20, 2σ).
+4. **Trains per-symbol models**:
    - **LSTM** (TensorFlow/Keras) for multi-horizon **returns** (1/7/30/90-day heads), converted back to prices from the anchor close.
    - **Auto-ARIMA** (`pmdarima`) on log closes; forecasts are **refit from cached data** when you request a prediction so they stay aligned with the latest bars.
-4. **Blends** LSTM and ARIMA into an **ensemble** (default **60% LSTM / 40% ARIMA**) with simple confidence-style bands.
-5. **Backtests** on a recent holdout window (walk-forward style evaluation; can take around a minute per run).
+5. **Blends** LSTM and ARIMA into an **ensemble** (default **60% LSTM / 40% ARIMA**) with simple confidence-style bands.
+6. **Backtests** on a recent holdout window (walk-forward style evaluation; can take around a minute per run).
 
 You interact through:
 
@@ -59,7 +60,7 @@ You interact through:
 |--------|------------|-------------------------|
 | **API server** | FastAPI + Uvicorn | `http://127.0.0.1:8000` |
 | **Web UI** | React, TypeScript, Vite, Recharts | `http://localhost:5173` |
-| **Price database** | SQLite + SQLAlchemy | `backend/nasdaq_predictor.db` |
+| **Price database** | SQLite + SQLAlchemy | `backend/nasdaq_predictor.db` (`price_bars`, optional `macro_daily`, saved backtest runs) |
 | **Saved ML files** | `.keras`, `.joblib`, `.pkl` | `backend/saved_models/` |
 | **API prefix** | Routers mounted under `/api` | e.g. `GET /api/stocks` |
 
@@ -152,7 +153,9 @@ LIGHT_MODE=false
 | `PRICE_REFRESH_INTERVAL_HOURS` | Background scheduler interval for automatic price refresh of **active** tickers. |
 | `MODEL_DIR` | Directory for saved LSTM/ARIMA artifacts (default `backend/saved_models/`). |
 | `LSTM_EPOCHS`, `LSTM_EARLY_STOPPING_PATIENCE`, `LSTM_BATCH_SIZE`, `LSTM_UNITS`, `LSTM_DROPOUT`, `LSTM_LEARNING_RATE`, `SEQUENCE_LENGTH` | LSTM training hyperparameters (defaults tuned for longer training with early stopping). |
-| `LSTM_ROLLING_NORM_WINDOW` | Legacy compatibility setting (unused by the current return-based LSTM input pipeline). |
+| `USE_MACRO_FEATURES` | When **true** (default), price refresh also fills **`macro_daily`**, and the LSTM uses **12** input features (60×12 windows). When **false**, macro fetch is skipped and the LSTM uses **7** features (legacy width). |
+| `MACRO_TICKERS` | Yahoo symbols for macro columns (default: `^VIX`, `^TNX`, `DX-Y.NYB`, `CL=F`, `^GSPC`); length must match built-in macro column names in `config.py` (`MACRO_FEATURE_COLUMNS`). |
+| `LSTM_ROLLING_NORM_WINDOW` | Rolling window (default **252** trading days) for **per-macro** MinMax-style scaling after aligning macro series to equity dates (`merge_macro_features` in `indicators.py`). Separate from the LSTM’s main `MinMaxScaler` on the full feature matrix. |
 | `BACKTEST_YEARS` | Backtest walk-forward holdout length in **trading years** (default **10**, ≈2520 trading days; capped by cached data). |
 | `BACKTEST_MIN_PREHOLDOUT_ROWS` | Minimum daily bars **before** the holdout reserved for training the temporary LSTM (default **650**). If total history is short, the holdout is shortened automatically so LSTM training still has enough clean rows. |
 | `ENSEMBLE_WEIGHT_LSTM`, `ENSEMBLE_WEIGHT_ARIMA` | Ensemble blend weights (normalized when combined). |
@@ -182,8 +185,10 @@ python -m uvicorn main:app --reload --host 127.0.0.1 --port 8000
 ### What happens when the backend starts
 
 1. **Database tables** are created if missing (`init_db()`).
-2. If **active** tickers have **no** cached bars yet, a **startup backfill** may run in a **background thread** (so the server can accept requests while Yahoo responds).
-3. **APScheduler** starts a **recurring price refresh** for active tickers; the first run is **delayed** so it does not immediately duplicate the startup backfill.
+2. The log line **`LSTM input features (N): [...]`** records the active LSTM column count (7 vs 12 depending on `USE_MACRO_FEATURES`).
+3. If **active** tickers have **no** cached bars yet, a **startup backfill** may run in a **background thread** (so the server can accept requests while Yahoo responds). That run includes **macro** download when `USE_MACRO_FEATURES` is true.
+4. If the equity cache is **already warm**, a **macro-only** refresh may still run on startup so `macro_daily` stays populated.
+5. **APScheduler** starts a **recurring price refresh** for active tickers; the first run is **delayed** so it does not immediately duplicate the startup backfill.
 
 Keep this terminal open while you use the app.
 
@@ -231,8 +236,9 @@ You can execute **GET** and **POST** requests from there (refresh, train, histor
 
 1. Downloads recent daily history from Yahoo Finance.
 2. **Replaces** that symbol’s rows in SQLite for a clean, consistent window.
+3. If **`USE_MACRO_FEATURES`** is true, downloads the configured **macro tickers** and **replaces** all rows in **`macro_daily`** (aligned dates, forward-filled gaps).
 
-The HTTP response returns immediately with `status: accepted`; watch the **backend terminal** for completion logs.
+The HTTP response returns immediately with `status: accepted` and a `detail` string; it returns **HTTP 409** if a refresh is already running (poll status instead of retrying blindly). Poll **`GET /api/admin/refresh-status`** for a **progress bar** in the UI (`state`, `percent`, `current_ticker`, etc.). Watch the **backend terminal** for completion logs.
 
 ### 8.2 How to trigger refresh
 
@@ -262,15 +268,16 @@ The backend also runs a **scheduled** refresh on an interval (`PRICE_REFRESH_INT
 
 - **GET `/api/stocks/{ticker}/prediction`** and **GET `/api/index/ndx`** require a **saved LSTM** for that symbol under `backend/saved_models/`.
 - The **LSTM** learns **cumulative simple returns** `(close[t+h]/close[t]) - 1` and converts predicted returns back to prices using the anchor close.
-- LSTM input features use **MinMaxScaler**, fit on the training split only and saved in model metadata.
+- LSTM input features use **MinMaxScaler**, fit on the training split only and saved in model metadata (`*_lstm_meta.joblib`). Macro columns are **rolling-normalized** over `LSTM_ROLLING_NORM_WINDOW` before entering that matrix when macros are enabled.
+- **Checkpoint compatibility:** metadata **`meta_version`** must match the code (currently **4**). Changing `USE_MACRO_FEATURES` or the LSTM input width requires **deleting** that ticker’s folder under `saved_models/` (or the `lstm.keras` / `lstm_meta.joblib` files inside it) and retraining—otherwise load/predict will fail or error.
 - **ARIMA** training saves a pickle for bookkeeping; **live predictions** refit ARIMA from the **current** SQLite series when you call the prediction endpoint.
 
 ### 9.2 How to train
 
 **POST `/api/admin/train-models`** queues a background job that, for each **active** ticker:
 
-1. Trains (or retrains) the **LSTM** and writes `*_lstm.keras` + `*_lstm_meta.joblib`.
-2. Fits **auto_arima** and writes `*_arima.pkl`.
+1. Trains (or retrains) the **LSTM** and writes `lstm.keras` + `lstm_meta.joblib` under `saved_models/<ticker>/` (e.g. `saved_models/AAPL/lstm.keras`; `^NDX` uses folder `NDX`).
+2. Fits **auto_arima** and writes `arima.pkl` in the same ticker folder.
 
 | Method | Action |
 |--------|--------|
@@ -287,7 +294,7 @@ The backend also runs a **scheduled** refresh on an interval (`PRICE_REFRESH_INT
 
 - Reload the **Dashboard** or open **Analysis** for a symbol.
 - If prediction still fails, check that this ticker’s LSTM files exist in `backend/saved_models/` and read the error message in the API response.
-- If model files were trained before the return-based pipeline update, run a full retrain so incompatible checkpoints are replaced.
+- If model files were trained before a **meta_version** or **input-width** change (return-based pipeline, macro features, etc.), delete the affected `saved_models/<ticker>/` trees (or run a full retrain after clearing `saved_models/`).
 
 ---
 
@@ -322,6 +329,7 @@ Ensure the **backend** is still running on **port 8000** so the **proxy** for `/
 - For a subset of symbols that have prices, the UI may attempt to load **7-day ensemble** estimates (requires trained LSTM for those symbols).
 - **Refresh prices** → `POST /api/admin/refresh`
 - **Train models** → `POST /api/admin/train-models`
+- **Price refresh progress** card polls `GET /api/admin/refresh-status` (same style: percent, current symbol, completion state).
 - **Training progress** card polls `GET /api/admin/training-status` (state, percent, current ticker/step).
 - **Analysis** → opens the stock detail route for that ticker.
 
@@ -344,8 +352,8 @@ Ensure the **backend** is still running on **port 8000** so the **proxy** for `/
   - **4:** Direction accuracy focus
   - **5:** Combined honest assessment (single LSTM training pass for price + direction outputs)
 - Responses include `holdout_years_requested` and `holdout_years_actual` (actual is silently capped by available data).
-- **Run bulk test (scenario 5)** calls `POST /api/admin/backtest-all` and shows a sortable table:
-  `Ticker | Verdict | MAPE 30d | Direction 7d | Status`.
+- **Run bulk test (scenario 5)** calls **`POST /api/admin/backtest-all`** (returns **accepted** immediately), then the UI **polls `GET /api/admin/backtest-status`** until `state` is `completed` or `error`, and shows a **bulk backtest progress** bar (percent, current ticker). Results then appear in the same sortable table: `Ticker | Verdict | MAPE 30d | Direction 7d | Status`. **HTTP 409** if a bulk job is already running.
+- Saved runs: **Saved backtests** / **Compare** routes use **`GET /api/backtest-runs`** (see Swagger for detail and delete).
 - Expect heavy runs to take a while; avoid repeated clicks during active processing.
 
 ---
@@ -366,10 +374,16 @@ Base URL (direct to backend): `http://127.0.0.1:8000`
 | GET | `/api/stocks/{ticker}/prediction` | Ensemble 7/30/90d forecast (needs LSTM). |
 | GET | `/api/stocks/{ticker}/backtest` | Backtest metrics + series (`scenario`, optional `years`, optional `max_holdout`). |
 | GET | `/api/index/ndx` | Same ensemble JSON as `^NDX` prediction route. |
-| POST | `/api/admin/refresh` | Background Yahoo refresh for **active** tickers. |
-| POST | `/api/admin/train-models` | Background LSTM + ARIMA train for **active** tickers. |
+| GET | `/api/admin/refresh-status` | Price refresh job progress (poll while `running`). |
+| POST | `/api/admin/refresh` | Queue Yahoo refresh for **active** tickers + macro table when enabled; **409** if already refreshing. |
+| POST | `/api/admin/train-models` | Background LSTM + ARIMA train for **active** tickers; **409** if training already running. |
 | GET | `/api/admin/training-status` | Training progress (`idle/running/completed/error`, percent, current ticker/step). |
-| POST | `/api/admin/backtest-all` | Sequential bulk scenario-5 backtest across active tickers with aggregate summary. |
+| GET | `/api/admin/backtest-status` | Bulk scenario-5 job progress; `result` holds the full payload when `completed`. |
+| POST | `/api/admin/backtest-all` | Queue sequential bulk scenario-5 backtest; **409** if a job is already running. |
+| GET | `/api/backtest-runs` | List saved backtest runs (SQLite). |
+| GET | `/api/backtest-runs/{id}` | Saved run detail. |
+| GET | `/api/backtest-runs/compare/summary` | Compare two runs (`a`, `b` query params). |
+| DELETE | `/api/backtest-runs/{id}` | Delete a saved run. |
 
 Unknown tickers (not in the configured universe) return **404** from the stock routes.
 
@@ -399,9 +413,9 @@ Unknown tickers (not in the configured universe) return **404** from the stock r
   - holdout is silently capped to keep enough pre-holdout rows for LSTM training
   - response returns both `holdout_years_requested` and `holdout_years_actual`
 - **ARIMA:** one-step walk-forward updates on the test segment.
-- **LSTM:** trained only on data before holdout into a temporary folder; evaluated one-step or multi-step depending on scenario.
+- **LSTM:** trained only on data before holdout into a temporary folder; evaluated one-step or multi-step depending on scenario. When macros are enabled, features merge **`macro_daily`** with **no lookahead** (macro rows after the current equity date are not used; rollouts slice macro up to the synthetic path’s last date).
 - **Scenario 5:** combines scenario-2 price metrics and scenario-4 direction metrics in one pass, then adds a verdict.
-- **Bulk mode:** `POST /api/admin/backtest-all?scenario=5&years=5` runs sequentially per active ticker, continues on failures, and returns aggregate stats.
+- **Bulk mode:** `POST /api/admin/backtest-all?scenario=5&years=5` queues a background job; poll **`GET /api/admin/backtest-status`** for progress and the final `result` object. Runs sequentially per active ticker, continues on failures, and includes aggregate stats (and optional `saved_run_id` when persistence succeeds).
 - **Ensemble series** aligns dates where both model streams exist.
 
 If you see TensorFlow **retracing** warnings in the log during backtests, they are a known performance warning and do not necessarily mean wrong numbers.
@@ -439,10 +453,13 @@ SQLite and `saved_models/` persist on disk for the next run.
 |------|----------|
 | `nasdaq-predictor/backend/main.py` | FastAPI app, CORS, scheduler, `/api/index/ndx`. |
 | `nasdaq-predictor/backend/config.py` | Settings and defaults. |
-| `nasdaq-predictor/backend/nasdaq_predictor.db` | Cached OHLCV. |
-| `nasdaq-predictor/backend/saved_models/` | LSTM `.keras`, `.joblib`, ARIMA `.pkl`. |
+| `nasdaq-predictor/backend/nasdaq_predictor.db` | Cached OHLCV, macro daily rows, app meta, saved backtest runs. |
+| `nasdaq-predictor/backend/saved_models/` | One subfolder per ticker (`AAPL/`, `NDX/` for `^NDX`, …) with `lstm.keras`, `lstm_meta.joblib`, `arima.pkl`. |
 | `nasdaq-predictor/frontend/vite.config.ts` | Dev server port **5173** and `/api` proxy. |
-| `nasdaq-predictor/frontend/src/pages/` | Dashboard, stock detail, backtest pages. |
+| `nasdaq-predictor/frontend/src/pages/` | Dashboard, stock detail, backtest + saved run history/compare/detail pages. |
+| `nasdaq-predictor/frontend/src/components/RefreshProgress.tsx` | Price refresh progress bar (Dashboard). |
+| `nasdaq-predictor/frontend/src/components/BacktestProgress.tsx` | Bulk backtest progress bar (Backtesting page). |
+| `nasdaq-predictor/docs/` | `ALGORITHM.md`, `BACKTEST_GUIDE.md`, `CODE_REFERENCE.md`. |
 | `nasdaq-predictor/frontend/src/api/client.ts` | Axios paths used by the UI. |
 
 ---
@@ -455,8 +472,11 @@ SQLite and `saved_models/` persist on disk for the next run.
 |---------|------------------|
 | UI loads but **no data** / errors on fetch | Backend running on **8000**? Vite proxy unchanged? Browser console for failed `/api` calls. |
 | **`/health` works** but `/api/stocks` has all **null** prices | Run **POST `/api/admin/refresh`**; confirm `LIGHT_MODE` and **active** tickers; wait for background job. |
-| **Prediction** returns **400** / train first | Run **POST `/api/admin/train-models`**; wait; confirm `*_lstm.keras` exists for that ticker. |
+| **Prediction** returns **400** / train first | Run **POST `/api/admin/train-models`**; wait; confirm `saved_models/<ticker>/lstm.keras` exists. |
 | Training appears stalled | Check **GET `/api/admin/training-status`** (or Dashboard progress card) for state/current ticker/step. |
+| Refresh or bulk backtest **409** | Another job of that type is already running; use **refresh-status** or **backtest-status** to wait. |
+| LSTM load error / **meta_version** | Remove incompatible checkpoints under **`saved_models/`** and retrain after changing `USE_MACRO_FEATURES` or upgrading LSTM pipeline. |
+| **`macro_daily` empty** | Run **POST `/api/admin/refresh`** with `USE_MACRO_FEATURES=true`; check logs for Yahoo errors on macro symbols. |
 | **404** on a ticker | Symbol must be in the app’s **tracked universe** (see `backend/utils/nasdaq100_tickers.py`). |
 | Requested holdout years not honored exactly | Expected when history is insufficient; inspect `holdout_years_actual` and `holdout_note` in the response. |
 | Bulk backtest has partial failures | Expected behavior: failures are reported in per-ticker `status`; other tickers continue. |
@@ -479,5 +499,7 @@ SQLite and `saved_models/` persist on disk for the next run.
 7. [ ] Open `http://localhost:5173` → Dashboard → **Analysis** / **Backtest**  
 
 ---
+
+**Further reading:** `docs/ALGORITHM.md` (LSTM + ensemble + macro features), `docs/BACKTEST_GUIDE.md` (scenarios and bulk jobs), `docs/CODE_REFERENCE.md` (file map and API details).
 
 *This guide matches the repository layout under `nasdaq-predictor/`. If you move folders, update paths accordingly.*

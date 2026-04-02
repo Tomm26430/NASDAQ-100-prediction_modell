@@ -22,9 +22,9 @@ logger = logging.getLogger(__name__)
 
 
 def _arima_path(ticker: str, model_root: Path | None = None) -> Path:
+    """Path MODEL_DIR/<ticker_dir>/arima.pkl."""
     base = model_root if model_root is not None else settings.MODEL_DIR
-    base.mkdir(parents=True, exist_ok=True)
-    return base / f"{artifact_stem(ticker)}_arima.pkl"
+    return base / artifact_stem(ticker) / "arima.pkl"
 
 
 def arima_model_exists(ticker: str, model_root: Path | None = None) -> bool:
@@ -61,6 +61,7 @@ def train_arima_for_ticker(
     )
 
     path = _arima_path(ticker, model_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("wb") as fh:
         pickle.dump({"model": model, "log_space": True}, fh)
     logger.info("Saved ARIMA for %s -> %s", ticker, path)

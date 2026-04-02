@@ -7,9 +7,11 @@ Relevant code:
 - `backend/services/lstm_model.py`
 - `backend/services/arima_model.py`
 - `backend/services/ensemble.py`
+- `backend/services/indicators.py` (`merge_macro_features`)
+- `backend/services/data_fetcher.py` (`get_macro_dataframe`)
 - `backend/config.py`
 - API route: `backend/routers/stocks.py` (`GET /api/stocks/{ticker}/backtest`)
-- Bulk route: `backend/routers/admin.py` (`POST /api/admin/backtest-all`)
+- Bulk route: `backend/routers/admin.py` (`POST /api/admin/backtest-all`, `GET /api/admin/backtest-status`)
 
 ---
 
@@ -39,12 +41,15 @@ Why it’s not a guarantee:
 All scenarios share the same high-level skeleton in `run_backtest()`:
 
 1. Load cached OHLCV via `get_ohlcv_dataframe(...)`.
-2. Slice a holdout window using `_holdout_slice(...)`.
-3. Compute ARIMA one-step walk-forward predictions once using `arima_walk_one_step(...)` (used directly in scenarios 1 & 4; referenced in 2/3).
-4. For each scenario:
+2. When **`USE_MACRO_FEATURES`** is true, load **`macro_daily`** via `get_macro_dataframe(...)` once and pass it into scenario helpers. Macro values are merged onto equity dates with **no lookahead**: rows after the last bar of the current frame (including synthetic rollout bars) are not used; missing macro dates are forward-filled from the last known value, then rolling-scaled (see `merge_macro_features`). **ARIMA** paths are unchanged (log closes only).
+3. Slice a holdout window using `_holdout_slice(...)`.
+4. Compute ARIMA one-step walk-forward predictions once using `arima_walk_one_step(...)` (used directly in scenarios 1 & 4; referenced in 2/3).
+5. For each scenario:
    - Train a **temporary** LSTM on the pre-holdout segment (`train_lstm_for_ticker(..., model_root=tempdir)`).
    - Evaluate using that LSTM + ARIMA according to the scenario’s rules.
-5. Return a JSON response with scenario label, holdout notes, metrics, and (usually) a chart series.
+6. Return a JSON response with scenario label, holdout notes, metrics, and (usually) a chart series.
+
+Set **`USE_MACRO_FEATURES=false`** in config / `.env` to reproduce the older **7-feature** LSTM-only price+indicator behavior (still requires compatible checkpoints under `saved_models/`).
 
 ### Scenario 1 — Daily prediction accuracy (optimistic)
 
@@ -303,13 +308,19 @@ Bulk test runs Scenario 5 sequentially for every “active” ticker (respects `
 ### 5.2 How to trigger it
 
 API:
-- `POST /api/admin/backtest-all?scenario=5&years=5`
+- `POST /api/admin/backtest-all?scenario=5&years=5` — returns **immediately** with `status: accepted` (HTTP **409** if a job is already running).
 - `POST /api/admin/backtest-all?scenario=5&max_holdout=true`
+- Poll **`GET /api/admin/backtest-status`** until `state` is `completed` or `error`; the full bulk JSON (same shape as before) is in **`result`** when completed.
+
+Web UI:
+- The Backtesting page starts the job, polls automatically, and shows a **progress bar** (percent + current ticker).
 
 Implementation:
-- `backend/services/backtester.py::run_backtest_all(...)`
+- `backend/services/backtester.py::run_backtest_all(...)` (invoked from a FastAPI **BackgroundTasks** worker).
+- `backend/services/backtest_status.py` holds progress for the status endpoint.
 - Runs tickers **sequentially**.
 - If one ticker fails, it records `status = "error: <message>"` and continues.
+- Optional persistence to SQLite (`persist=true` by default) for history/compare pages (`saved_run_id` in `result` when saving succeeds).
 
 ### 5.3 How to read the results
 

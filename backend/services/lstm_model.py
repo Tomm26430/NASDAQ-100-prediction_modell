@@ -1,14 +1,14 @@
 """
-LSTM forecaster: sequence input (60 days × features), four heads for cumulative simple returns
-at +1, +7, +30, +90 trading days vs the reference bar.
+LSTM forecaster: sequence input (60 days × N features; N=7 without macro, N=12 with USE_MACRO_FEATURES),
+four heads for cumulative simple returns at +1, +7, +30, +90 trading days vs the reference bar.
 
 Training targets are percentage returns: (close[t+h] / close[t]) - 1. At inference,
 predicted_price = anchor_close * (1 + predicted_return), where anchor_close is the last row's
 close in the window (real or synthetic during rollouts).
 
 Input features are return-based columns scaled with sklearn MinMaxScaler (fit on the training
-split only, then saved in the meta joblib). Artifacts live under `saved_models/` or a temp folder
-for backtests.
+split only, then saved in the meta joblib). Artifacts live under `saved_models/<ticker>/lstm.keras`
+(and `lstm_meta.joblib`), or under `<temp>/<ticker>/` during backtests.
 """
 
 from __future__ import annotations
@@ -23,8 +23,8 @@ from sklearn.preprocessing import MinMaxScaler
 from sqlalchemy.orm import Session
 
 from config import settings
-from services.data_fetcher import get_ohlcv_dataframe
-from services.indicators import add_indicators
+from services.data_fetcher import get_macro_dataframe, get_ohlcv_dataframe
+from services.indicators import add_indicators, macro_feature_columns, merge_macro_features
 from utils.ml_paths import artifact_stem
 
 logger = logging.getLogger(__name__)
@@ -33,12 +33,13 @@ logger = logging.getLogger(__name__)
 _HORIZON_DAYS = (1, 7, 30, 90)
 
 # Saved checkpoints with meta_version below this must be retrained (input scaling / heads changed).
-_META_VERSION = 3
+# v4: optional macro columns (12 features when USE_MACRO_FEATURES).
+_META_VERSION = 4
 
 
 def lstm_feature_columns() -> list[str]:
-    """Column order fed into the LSTM after MinMax scaling."""
-    return [
+    """Column order fed into the LSTM after MinMax scaling (7 base + 5 macro when enabled)."""
+    base = [
         "ret_close",
         "ret_volume",
         "rsi_14",
@@ -47,6 +48,13 @@ def lstm_feature_columns() -> list[str]:
         "bb_upper_rel",
         "bb_lower_rel",
     ]
+    return base + macro_feature_columns()
+
+
+def log_lstm_feature_summary() -> None:
+    """Call once at app startup to record the active LSTM input width and names."""
+    cols = lstm_feature_columns()
+    logger.info("LSTM input features (%d): %s", len(cols), cols)
 
 
 def min_ohlcv_rows_for_lstm_window(seq_len: int) -> int:
@@ -55,10 +63,10 @@ def min_ohlcv_rows_for_lstm_window(seq_len: int) -> int:
 
 
 def _paths(ticker: str, model_root: Path | None = None) -> tuple[Path, Path]:
+    """Paths under MODEL_DIR/<ticker_dir>/lstm.keras and lstm_meta.joblib."""
     base = model_root if model_root is not None else settings.MODEL_DIR
-    base.mkdir(parents=True, exist_ok=True)
-    stem = artifact_stem(ticker)
-    return base / f"{stem}_lstm.keras", base / f"{stem}_lstm_meta.joblib"
+    sub = base / artifact_stem(ticker)
+    return sub / "lstm.keras", sub / "lstm_meta.joblib"
 
 
 def lstm_model_exists(ticker: str, model_root: Path | None = None) -> bool:
@@ -80,6 +88,9 @@ def _lstm_raw_features(feat: pd.DataFrame) -> pd.DataFrame:
     out["macd_signal_rel"] = feat["macd_signal"].astype(float) / safe
     out["bb_upper_rel"] = (feat["bb_upper"].astype(float) - close) / safe
     out["bb_lower_rel"] = (feat["bb_lower"].astype(float) - close) / safe
+    if settings.USE_MACRO_FEATURES:
+        for col in macro_feature_columns():
+            out[col] = feat[col].astype(float) if col in feat.columns else 0.0
     return out.replace([np.inf, -np.inf], np.nan)
 
 
@@ -150,6 +161,13 @@ def train_lstm_for_ticker(
     if train_end_exclusive is not None:
         df = df.iloc[:train_end_exclusive]
     feat = add_indicators(df).ffill().fillna(0.0)
+    if settings.USE_MACRO_FEATURES:
+        macro = get_macro_dataframe(session)
+        if macro is not None and not macro.empty:
+            cutoff = df.index.max()
+            macro = macro.loc[macro.index <= cutoff]
+            feat = merge_macro_features(feat, macro)
+    feat = feat.fillna(0.0)
     seq_len = settings.SEQUENCE_LENGTH
     X_raw, y_raw = _build_xy(feat, seq_len)
     n_s, s_len, n_f = X_raw.shape
@@ -194,6 +212,7 @@ def train_lstm_for_ticker(
     )
 
     model_path, meta_path = _paths(ticker, model_root)
+    model_path.parent.mkdir(parents=True, exist_ok=True)
     model.save(model_path)
     joblib.dump(
         {
@@ -256,6 +275,11 @@ def predict_lstm_horizons(
     """
     df = get_ohlcv_dataframe(session, ticker)
     feat = add_indicators(df).ffill().fillna(0.0)
+    if settings.USE_MACRO_FEATURES:
+        macro = get_macro_dataframe(session)
+        if macro is not None and not macro.empty:
+            feat = merge_macro_features(feat, macro)
+    feat = feat.fillna(0.0)
     model, meta = _load_keras_and_meta(ticker, model_root)
     seq_len = int(meta["seq_len"])
     need = min_ohlcv_rows_for_lstm_window(seq_len)

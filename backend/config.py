@@ -7,7 +7,11 @@ for example: LIGHT_MODE=false
 
 from pathlib import Path
 
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# SQLite `macro_daily` column names and LSTM macro inputs (same order as MACRO_TICKERS).
+MACRO_FEATURE_COLUMNS: tuple[str, ...] = ("vix", "treasury_10y", "dollar_index", "oil_wti", "sp500_close")
 
 
 # Directory where this file lives (backend/)
@@ -28,6 +32,14 @@ class Settings(BaseSettings):
 
     # When True, only a handful of symbols are fetched/trained (fast local testing).
     LIGHT_MODE: bool = True
+
+    # When True, download macro series into macro_daily and expand LSTM inputs (7 → 12 features).
+    USE_MACRO_FEATURES: bool = True
+
+    # Yahoo Finance symbols for macro inputs (order must match MACRO_FEATURE_COLUMNS in config.py).
+    MACRO_TICKERS: list[str] = Field(
+        default_factory=lambda: ["^VIX", "^TNX", "DX-Y.NYB", "CL=F", "^GSPC"],
+    )
 
     # Full path to the SQLite database file.
     DATABASE_URL: str = f"sqlite:///{_DEFAULT_DB}"
@@ -78,6 +90,15 @@ class Settings(BaseSettings):
     # Ensemble weights (LSTM, ARIMA)
     ENSEMBLE_WEIGHT_LSTM: float = 0.6
     ENSEMBLE_WEIGHT_ARIMA: float = 0.4
+
+    @model_validator(mode="after")
+    def _macro_lists_align(self):
+        if len(self.MACRO_TICKERS) != len(MACRO_FEATURE_COLUMNS):
+            raise ValueError(
+                f"MACRO_TICKERS length ({len(self.MACRO_TICKERS)}) must match "
+                f"MACRO_FEATURE_COLUMNS ({len(MACRO_FEATURE_COLUMNS)}).",
+            )
+        return self
 
 
 settings = Settings()
