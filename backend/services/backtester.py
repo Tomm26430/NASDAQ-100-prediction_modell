@@ -30,6 +30,26 @@ from utils.nasdaq100_tickers import get_active_tickers
 
 logger = logging.getLogger(__name__)
 
+# Optional UI progress for bulk runs (see services.backtest_status).
+def _bulk_progress_tick(sym: str, index_1based: int, total: int) -> None:
+    try:
+        from services.backtest_status import is_backtest_running, set_current_ticker
+
+        if is_backtest_running():
+            set_current_ticker(sym, index_1based, total)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _bulk_progress_done_one() -> None:
+    try:
+        from services.backtest_status import is_backtest_running, record_ticker_finished
+
+        if is_backtest_running():
+            record_ticker_finished()
+    except Exception:  # noqa: BLE001
+        pass
+
 # Human-readable labels returned in JSON for each scenario id.
 SCENARIO_LABELS: dict[int, str] = {
     1: "Daily prediction accuracy",
@@ -1033,14 +1053,21 @@ def run_backtest_all(
     scenario: int = 5,
     years: float | None = None,
     max_holdout: bool = False,
+    persist: bool = True,
 ) -> dict:
     """
     Run `run_backtest` sequentially for every active ticker (LIGHT_MODE-aware).
     Used by POST /api/admin/backtest-all. Continues on per-ticker failure.
+
+    Uses light=False so each ticker returns full scenario-5 payloads (series/metrics) for SQLite storage.
     """
     tickers = get_active_tickers()
     results: dict[str, dict] = {}
-    for sym in tickers:
+    full_payload_by_ticker: dict[str, dict | None] = {}
+    holdout_years_requested: float | None = None
+    holdout_years_actual: float | None = None
+    for i, sym in enumerate(tickers):
+        _bulk_progress_tick(sym, i + 1, len(tickers))
         try:
             r = run_backtest(
                 session,
@@ -1048,8 +1075,11 @@ def run_backtest_all(
                 scenario=scenario,
                 years=years,
                 max_holdout=max_holdout,
-                light=True,
+                light=False,
             )
+            if holdout_years_actual is None and r.get("holdout_years_actual") is not None:
+                holdout_years_requested = r.get("holdout_years_requested")  # type: ignore[assignment]
+                holdout_years_actual = float(r["holdout_years_actual"])
             pa = r.get("price_accuracy")
             pm = pa.get("metrics", {}) if isinstance(pa, dict) else {}
             ens = pm.get("ensemble", {}) if isinstance(pm, dict) else {}
@@ -1068,6 +1098,7 @@ def run_backtest_all(
                 "direction_accuracy_7d": d7,
                 "holdout_days": int(r.get("holdout_trading_days", 0)),
             }
+            full_payload_by_ticker[sym] = r
         except Exception as exc:  # noqa: BLE001
             logger.exception("Backtest-all failed for %s", sym)
             results[sym] = {
@@ -1077,6 +1108,9 @@ def run_backtest_all(
                 "direction_accuracy_7d": float("nan"),
                 "holdout_days": 0,
             }
+            full_payload_by_ticker[sym] = None
+        finally:
+            _bulk_progress_done_one()
 
     ok_rows = {k: v for k, v in results.items() if v["status"] == "ok"}
     mapes = [v["mape_30d"] for v in ok_rows.values() if np.isfinite(v["mape_30d"])]
@@ -1127,20 +1161,44 @@ def run_backtest_all(
     else:
         years_reported = float(settings.BACKTEST_YEARS)
 
+    aggregate = {
+        "avg_mape_30d": avg_mape,
+        "avg_direction_accuracy_7d": avg_dir,
+        "best_ticker": _best_by_dir(),
+        "worst_ticker": _worst_by_dir(),
+        "tickers_above_50pct_direction": above_50,
+        "tickers_strong_model": strong,
+        "tickers_decent_model": decent,
+        "tickers_needs_improvement": needs,
+    }
+
+    saved_run_id: int | None = None
+    if persist and scenario == 5:
+        from services.backtest_storage import save_bulk_run
+
+        try:
+            saved_run_id = save_bulk_run(
+                session,
+                scenario=scenario,
+                years=years_reported if not max_holdout else None,
+                max_holdout=max_holdout,
+                holdout_years_requested=holdout_years_requested,
+                holdout_years_actual=holdout_years_actual,
+                aggregate=aggregate,
+                summary_by_ticker=results,
+                full_payload_by_ticker=full_payload_by_ticker,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Failed to persist bulk backtest: %s", exc)
+
     return {
         "scenario": scenario,
         "years": years_reported,
         "max_holdout": max_holdout,
         "tickers_tested": tickers,
         "results": results,
-        "aggregate": {
-            "avg_mape_30d": avg_mape,
-            "avg_direction_accuracy_7d": avg_dir,
-            "best_ticker": _best_by_dir(),
-            "worst_ticker": _worst_by_dir(),
-            "tickers_above_50pct_direction": above_50,
-            "tickers_strong_model": strong,
-            "tickers_decent_model": decent,
-            "tickers_needs_improvement": needs,
-        },
+        "aggregate": aggregate,
+        "saved_run_id": saved_run_id,
+        "holdout_years_requested": holdout_years_requested,
+        "holdout_years_actual": holdout_years_actual,
     }

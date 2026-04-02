@@ -19,7 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from config import settings
 from models.database import get_db, get_session_factory, init_db
-from routers import admin, stocks
+from routers import admin, backtest_runs, stocks
 from services.ensemble import ensemble_forecast
 from services.lstm_model import lstm_model_exists
 from services.data_fetcher import get_latest_bar, run_refresh_for_active_tickers
@@ -104,6 +104,7 @@ app.add_middleware(
 
 app.include_router(stocks.router, prefix="/api")
 app.include_router(admin.router, prefix="/api")
+app.include_router(backtest_runs.router, prefix="/api")
 
 
 @app.get("/api/index/ndx")

@@ -1,15 +1,18 @@
 import axios from "axios";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import {
   fetchPrediction,
+  fetchRefreshJobStatus,
   fetchStockList,
   fetchTrainingStatus,
   postRefresh,
   postTrainModels,
+  type RefreshJobStatus,
   type StockRow,
   type TrainingStatusResponse,
 } from "../api/client";
+import { RefreshProgress } from "../components/RefreshProgress";
 import { TrainingProgress } from "../components/TrainingProgress";
 
 type RowExtra = StockRow & { pred7?: number | null; predErr?: string };
@@ -22,12 +25,37 @@ export function Dashboard() {
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [trainingStatus, setTrainingStatus] = useState<TrainingStatusResponse | null>(null);
+  const [refreshStatus, setRefreshStatus] = useState<RefreshJobStatus | null>(null);
+  const lastRefreshRefetchAt = useRef<string | null>(null);
+
+  const reloadStocks = useCallback(async () => {
+    const data = await fetchStockList();
+    setRows(data.stocks);
+    setLight(data.light_mode);
+    setRefreshedAt(data.last_price_refresh_utc);
+    const withPrice = data.stocks.filter((s) => s.last_close != null).slice(0, 12);
+    const next: RowExtra[] = [...data.stocks];
+    await Promise.all(
+      withPrice.map(async (s) => {
+        try {
+          const p = await fetchPrediction(s.ticker);
+          const i = next.findIndex((r) => r.ticker === s.ticker);
+          if (i >= 0) next[i] = { ...next[i], pred7: p.horizons["7"].ensemble };
+        } catch {
+          const i = next.findIndex((r) => r.ticker === s.ticker);
+          if (i >= 0) next[i] = { ...next[i], predErr: "no model" };
+        }
+      }),
+    );
+    setRows(next);
+  }, []);
 
   useEffect(() => {
     const poll = async () => {
       try {
-        const s = await fetchTrainingStatus();
+        const [s, r] = await Promise.all([fetchTrainingStatus(), fetchRefreshJobStatus()]);
         setTrainingStatus(s);
+        setRefreshStatus(r);
       } catch {
         /* ignore poll errors */
       }
@@ -42,26 +70,8 @@ export function Dashboard() {
     (async () => {
       try {
         setLoading(true);
-        const data = await fetchStockList();
+        await reloadStocks();
         if (cancelled) return;
-        setRows(data.stocks);
-        setLight(data.light_mode);
-        setRefreshedAt(data.last_price_refresh_utc);
-        const withPrice = data.stocks.filter((s) => s.last_close != null).slice(0, 12);
-        const next: RowExtra[] = [...data.stocks];
-        await Promise.all(
-          withPrice.map(async (s) => {
-            try {
-              const p = await fetchPrediction(s.ticker);
-              const i = next.findIndex((r) => r.ticker === s.ticker);
-              if (i >= 0) next[i] = { ...next[i], pred7: p.horizons["7"].ensemble };
-            } catch {
-              const i = next.findIndex((r) => r.ticker === s.ticker);
-              if (i >= 0) next[i] = { ...next[i], predErr: "no model" };
-            }
-          }),
-        );
-        if (!cancelled) setRows(next);
       } catch (e: unknown) {
         if (!cancelled) setErr(e instanceof Error ? e.message : "Failed to load stocks");
       } finally {
@@ -71,15 +81,29 @@ export function Dashboard() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [reloadStocks]);
+
+  useEffect(() => {
+    const ft = refreshStatus?.finished_at;
+    if (refreshStatus?.state !== "completed" || !ft || lastRefreshRefetchAt.current === ft) return;
+    lastRefreshRefetchAt.current = ft;
+    void reloadStocks().catch(() => {
+      /* ignore */
+    });
+  }, [refreshStatus?.state, refreshStatus?.finished_at, reloadStocks]);
 
   async function onRefresh() {
     try {
-      setBusy("Refreshing prices…");
-      await postRefresh();
-      setBusy("Refresh queued. Reload in a few seconds.");
+      setBusy(null);
+      const res = await postRefresh();
+      setBusy(res.detail);
     } catch (e: unknown) {
-      setBusy(e instanceof Error ? e.message : "Refresh failed");
+      if (axios.isAxiosError(e) && e.response?.status === 409) {
+        const d = e.response?.data as { detail?: string };
+        setBusy(d?.detail ?? "A price refresh is already in progress.");
+      } else {
+        setBusy(e instanceof Error ? e.message : "Refresh failed");
+      }
     }
   }
 
@@ -114,6 +138,7 @@ export function Dashboard() {
           Train models (active tickers)
         </button>
       </div>
+      <RefreshProgress status={refreshStatus} />
       <TrainingProgress status={trainingStatus} />
       {busy && <p style={{ color: "#475569", fontSize: "0.9rem" }}>{busy}</p>}
       {err && <p className="err">{err}</p>}

@@ -4,6 +4,8 @@ Stock list, OHLCV history, indicators, ensemble predictions, and backtests.
 
 from __future__ import annotations
 
+import logging
+
 import pandas as pd
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
@@ -12,12 +14,15 @@ from sqlalchemy.orm import Session
 from config import settings
 from models.database import get_db
 from services.backtester import run_backtest
+from services.backtest_storage import save_single_run
 from services.data_fetcher import get_latest_bar_map, get_meta, get_ohlcv_dataframe
 from services.ensemble import ensemble_forecast
 from services.indicators import add_indicators
 from services.lstm_model import lstm_model_exists
 from utils.nasdaq100_tickers import all_tracked_symbols
 from utils.ticker_validate import require_tracked_ticker
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["stocks"])
 
@@ -175,17 +180,45 @@ def stock_backtest(
         False,
         description="If true, use the longest holdout allowed by cached bars (ignores years).",
     ),
+    persist: bool = Query(
+        True,
+        description="If true, save this backtest result to SQLite for history and charts.",
+    ),
     db: Session = Depends(get_db),
 ) -> dict:
     t = require_tracked_ticker(ticker)
     try:
-        return run_backtest(
+        out = run_backtest(
             db,
             t,
             scenario=scenario,
             years=years,
             max_holdout=max_holdout,
         )
+        saved_run_id: int | None = None
+        if persist:
+            try:
+                yreq = out.get("holdout_years_requested")
+                yact = out.get("holdout_years_actual")
+                years_for_save = (
+                    float(years)
+                    if years is not None
+                    else (float(yreq) if yreq is not None else None)
+                )
+                saved_run_id = save_single_run(
+                    db,
+                    scenario=scenario,
+                    years=years_for_save,
+                    max_holdout=max_holdout,
+                    holdout_years_requested=float(yreq) if yreq is not None else None,
+                    holdout_years_actual=float(yact) if yact is not None else None,
+                    ticker=t,
+                    response=out,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Failed to persist single backtest: %s", exc)
+        out["saved_run_id"] = saved_run_id
+        return out
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001

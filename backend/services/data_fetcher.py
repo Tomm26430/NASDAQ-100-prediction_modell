@@ -23,6 +23,26 @@ from utils.nasdaq100_tickers import get_active_tickers
 logger = logging.getLogger(__name__)
 
 
+def _refresh_progress_tick(sym: str, index_1based: int, total: int) -> None:
+    try:
+        from services.refresh_status import is_refresh_running, set_current_ticker
+
+        if is_refresh_running():
+            set_current_ticker(sym, index_1based, total)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _refresh_progress_done_one() -> None:
+    try:
+        from services.refresh_status import is_refresh_running, record_ticker_finished
+
+        if is_refresh_running():
+            record_ticker_finished()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _yahoo_ticker(symbol: str) -> str:
     """Normalize symbols for yfinance (already correct for US equities and ^NDX)."""
     return symbol.strip()
@@ -84,7 +104,9 @@ def refresh_many(session: Session, symbols: list[str]) -> dict[str, str]:
     Returns a map ticker -> "ok" or a short error string (for API reporting).
     """
     results: dict[str, str] = {}
-    for sym in symbols:
+    total = len(symbols)
+    for i, sym in enumerate(symbols):
+        _refresh_progress_tick(sym, i + 1, total)
         try:
             n = replace_price_history(session, sym)
             results[sym] = f"ok ({n} rows)"
@@ -92,6 +114,8 @@ def refresh_many(session: Session, symbols: list[str]) -> dict[str, str]:
             logger.exception("Failed to refresh %s", sym)
             session.rollback()
             results[sym] = str(exc)
+        finally:
+            _refresh_progress_done_one()
     return results
 
 

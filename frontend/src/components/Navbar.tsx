@@ -20,6 +20,12 @@ export function Navbar() {
         <Link to="/backtest" style={{ color: "#93c5fd" }}>
           Backtesting
         </Link>
+        <Link to="/backtest/history" style={{ color: "#93c5fd" }}>
+          Saved tests
+        </Link>
+        <Link to="/backtest/compare" style={{ color: "#93c5fd" }}>
+          Compare
+        </Link>
       </nav>
     </header>
   );

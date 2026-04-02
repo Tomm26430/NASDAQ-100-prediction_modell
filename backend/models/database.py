@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import date, datetime, timezone
 from typing import Generator
 
-from sqlalchemy import Date, DateTime, Float, Integer, String, UniqueConstraint, create_engine
+from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker, Session
 
 from config import settings
@@ -55,6 +55,47 @@ class AppMeta(Base):
 
     key: Mapped[str] = mapped_column(String(64), primary_key=True)
     value: Mapped[str] = mapped_column(String(256), nullable=False)
+
+
+class BacktestRun(Base):
+    """
+    One saved backtest session (single-ticker run or bulk multi-ticker run).
+
+    Aggregate JSON holds summary stats for bulk runs; single runs may omit it.
+    """
+
+    __tablename__ = "backtest_runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=lambda: datetime.now(timezone.utc),
+        index=True,
+    )
+    run_type: Mapped[str] = mapped_column(String(16), nullable=False)  # "single" | "bulk"
+    scenario: Mapped[int] = mapped_column(Integer, nullable=False)
+    years_requested: Mapped[float | None] = mapped_column(Float, nullable=True)
+    max_holdout: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    holdout_years_requested: Mapped[float | None] = mapped_column(Float, nullable=True)
+    holdout_years_actual: Mapped[float | None] = mapped_column(Float, nullable=True)
+    aggregate_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_ticker: Mapped[str | None] = mapped_column(String(32), nullable=True)  # single-run primary ticker
+
+
+class BacktestTickerResult(Base):
+    """Per-symbol result for a saved run; payload_json holds the full API-shaped backtest dict."""
+
+    __tablename__ = "backtest_ticker_results"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[int] = mapped_column(Integer, ForeignKey("backtest_runs.id", ondelete="CASCADE"), nullable=False, index=True)
+    ticker: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(512), nullable=False)
+    combined_verdict: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    mape_30d: Mapped[float | None] = mapped_column(Float, nullable=True)
+    direction_accuracy_7d: Mapped[float | None] = mapped_column(Float, nullable=True)
+    holdout_days: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    payload_json: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 _engine = None
